@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Generate the API reference into htmldocs/ with `nimony doc`.
+#
+#   doc/gen            # htmldocs/hashi/**.html + htmldocs/theindex.html
+#
+# The root module is src/hashi.nim, which imports every public module, so one
+# run documents the whole library. NIMONY= overrides the compiler, as for
+# tests/run.
+set -u
+cd "$(dirname "$0")/.." || exit 2
+if [ -z "${NIMONY:-}" ]; then
+  if [ -x ../nimony/bin/nimony ]; then NIMONY=../nimony/bin/nimony
+  elif command -v nimony >/dev/null; then NIMONY=$(command -v nimony)
+  else echo "nimony not found: set NIMONY= (see doc/building.md)" >&2; exit 2; fi
+fi
+rm -rf htmldocs
+"$NIMONY" doc src/hashi.nim >"${TMPDIR:-/tmp}/hashi-docgen.log" 2>&1
+rc=$?
+if [ $rc -ne 0 ]; then
+  # Current Nimony asserts ("todo") on an exported signature that mentions
+  # std/opt's Opt[T], after the page has been written. Treat that as a
+  # warning as long as the pages exist.
+  if [ -f htmldocs/hashi/http/server.html ] && grep -q 'todo' "${TMPDIR:-/tmp}/hashi-docgen.log"; then
+    echo "note: nimony doc exited $rc on the known Opt[T] assertion; pages were emitted" >&2
+  else
+    cat "${TMPDIR:-/tmp}/hashi-docgen.log" >&2
+    echo "doc generation failed (exit $rc)" >&2
+    exit $rc
+  fi
+fi
+n=$(find htmldocs -name '*.html' -path '*hashi*' | wc -l)
+cp htmldocs/hashi.html htmldocs/index.html
+echo "$n pages under htmldocs/ (open htmldocs/index.html)"

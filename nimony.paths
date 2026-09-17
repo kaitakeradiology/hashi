@@ -1,0 +1,2 @@
+# Module search path for the Nimony compiler, relative to this file.
+src

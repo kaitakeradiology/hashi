@@ -1,0 +1,33 @@
+# Forgejo CI: the hashi suite at every push to main, in host mode on a runner
+# with a prebuilt Nimony at /opt/nimony (label build-ct). The clone is fresh
+# from this repository at the pushed ref, so a run only ever tests what was
+# pushed. The GitHub workflow in .github/ does the same from a cold bootstrap.
+name: test
+on:
+  push:
+    branches: [main]
+jobs:
+  suite:
+    runs-on: build-ct
+    steps:
+      - name: hashi suite at the pushed ref
+        env:
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.server_url }}/${{ github.repository }}.git
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SRC=/build/hashi-ci
+          rm -rf "$SRC"
+          git -c "http.extraheader=Authorization: token $TOKEN" clone "$REPO" "$SRC"
+          cd "$SRC"
+          git checkout --detach "$SHA"
+          echo "hashi $(git rev-parse --short HEAD) — $(git log -1 --format=%s)"
+          export NIMONY=/opt/nimony/bin/nimony
+          ./tests/run
+          for f in examples/*.nim bench/bench_server.nim tests/smoke_ws_outq.nim; do
+            "$NIMONY" c "$f"
+          done
+          "$NIMONY" c -r tests/smoke_ws_outq.nim
+          python3 tests/conformance/ws_conformance.py "$(find nimcache -name hello -type f -perm -u+x | head -1)"
+          ./doc/gen

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Prove hashi builds from nothing: in a throwaway sandbox with a read-only
+# OS, an empty home and no access to this checkout beyond its git objects,
+# clone Nimony at the commit .github/workflows/test.yml pins, bootstrap it
+# with a stable Nim 2, clone hashi's committed tree, and run the suite, every
+# example, bench and smoke program, and the API docs. This is the local twin
+# of the public CI job, for checking a pin bump or a build-doc change before
+# pushing.
+#
+#   tests/clean_build /path/to/nim-2.2.x        # a Nim 2 install dir (has bin/nim)
+#   NIMONY_REF=<sha> tests/clean_build /path/to/nim-2.2.x
+#
+# Needs bubblewrap (`bwrap`) and network access for the Nimony clone. Takes
+# about half an hour, most of it the Nimony clone and bootstrap.
+set -eu
+cd "$(dirname "$0")/.."
+NIM_DIR="${1:?usage: tests/clean_build /path/to/nim-2.x (a directory with bin/nim)}"
+[ -x "$NIM_DIR/bin/nim" ] || { echo "no bin/nim under $NIM_DIR" >&2; exit 2; }
+command -v bwrap >/dev/null || { echo "bwrap (bubblewrap) is required" >&2; exit 2; }
+NIMONY_REF="${NIMONY_REF:-$(sed -n 's/^  NIMONY_REF: *//p' .github/workflows/test.yml)}"
+[ -n "$NIMONY_REF" ] || { echo "NIMONY_REF not set and not found in .github/workflows/test.yml" >&2; exit 2; }
+
+INNER=$(mktemp)
+trap 'rm -f "$INNER"' EXIT
+cat > "$INNER" <<'INNER_EOF'
+set -eu
+export HOME=/home/ci PATH=/opt/nim/bin:/usr/bin:/bin
+mkdir -p "$HOME/w" && cd "$HOME/w"
+echo "### environment"; nim -v | head -1; gcc --version | head -1; git --version
+echo "### nimony @ $NIMONY_REF"
+git clone -q --filter=blob:none https://github.com/nim-lang/nimony nimony
+(cd nimony && git checkout -q "$NIMONY_REF" && git log --oneline -1)
+echo "### bootstrap nimony"
+(cd nimony && nim c -r src/hastur/hastur --release build all > "$HOME/nimony-build.log" 2>&1) || {
+  echo "nimony bootstrap FAILED; last lines of the log:"; tail -30 "$HOME/nimony-build.log"; exit 3; }
+echo "### hashi"
+git clone -q /src/hashi.git hashi && cd hashi && git log --oneline -1
+export NIMONY=../nimony/bin/nimony
+echo "### tests/run"
+tests/run
+echo "### examples, benches, smoke programs"
+for f in examples/*.nim bench/bench_server.nim tests/smoke_ws_outq.nim; do
+  "$NIMONY" c "$f" >/dev/null 2>&1 && echo "build ok   $f" || { echo "build FAIL $f"; exit 4; }
+done
+echo "### outbound-queue smoke"
+"$NIMONY" c -r tests/smoke_ws_outq.nim
+echo "### WebSocket conformance over raw sockets"
+python3 tests/conformance/ws_conformance.py "$(find nimcache -name hello -type f -perm -u+x | head -1)"
+echo "### doc/gen"
+doc/gen
+echo "### CLEAN BUILD PASSED"
+INNER_EOF
+
+exec bwrap \
+  --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/bin /bin \
+  --ro-bind /etc /etc --dev /dev --proc /proc --tmpfs /tmp --tmpfs /home \
+  --ro-bind "$NIM_DIR" /opt/nim \
+  --ro-bind "$PWD/.git" /src/hashi.git \
+  --ro-bind "$INNER" /clean_build_inner.sh \
+  --setenv NIMONY_REF "$NIMONY_REF" \
+  --unshare-all --share-net \
+  -- /usr/bin/bash /clean_build_inner.sh

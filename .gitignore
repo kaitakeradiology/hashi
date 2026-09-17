@@ -1,0 +1,13 @@
+# Build artifacts
+nimcache/
+.build/
+*.exe
+htmldocs/
+
+# Editor / OS
+*.swp
+.DS_Store
+.idea/
+.vscode/
+
+# Test and benchmark output

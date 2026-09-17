@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Run the hashi test suite under Nimony.
+#
+# Nimony has no Testament; each tests/test_*.nim (and fuzz_*.nim) is a
+# standalone program that imports testkit and exits non-zero on failure.
+# This runner compiles+runs each and aggregates the result.
+#
+#   tests/run            # unit tests (test_*.nim)
+#   tests/run --fuzz     # unit tests + fuzzers (fuzz_*.nim)
+#   tests/run test_http_request   # a single test by name
+set -u
+
+cd "$(dirname "$0")/.." || exit 2
+# Nimony compiler resolution (same convention as bench/run.sh):
+# NIMONY= override, else the sibling checkout, else `nimony` on PATH.
+if [ -z "${NIMONY:-}" ]; then
+  if [ -x ../nimony/bin/nimony ]; then
+    NIMONY=../nimony/bin/nimony
+  elif command -v nimony >/dev/null; then
+    NIMONY=$(command -v nimony)
+  else
+    echo "nimony not found: set NIMONY=, build a sibling ../nimony checkout," >&2
+    echo "or put nimony on PATH (see doc/building.md)" >&2
+    exit 2
+  fi
+fi
+[ -x "$NIMONY" ] || { echo "nimony not found at $NIMONY (set NIMONY= to override)" >&2; exit 2; }
+
+# Colour the runner's own lines on a terminal (testkit colours its own output);
+# off when piped/redirected or NO_COLOR is set, matching testkit's gate.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_HDR=$'\e[1;36m'; C_OK=$'\e[1;32m'; C_ERR=$'\e[1;31m'; C_OFF=$'\e[0m'
+else
+  C_HDR=''; C_OK=''; C_ERR=''; C_OFF=''
+fi
+
+pattern="tests/test_*.nim"
+[ "${1:-}" = "--fuzz" ] && { pattern="tests/test_*.nim tests/fuzz_*.nim"; shift; }
+[ $# -gt 0 ] && pattern="tests/$1.nim"
+
+fail=0
+for t in $pattern; do
+  [ -f "$t" ] || continue
+  echo "${C_HDR}═══ $(basename "$t") ═══${C_OFF}"
+  if ! "$NIMONY" c -r "$t"; then
+    echo "${C_ERR}✗ $(basename "$t") FAILED${C_OFF}"
+    fail=1
+  fi
+  echo ""
+done
+
+[ $fail -eq 0 ] && echo "${C_OK}ALL TESTS PASSED${C_OFF}" || echo "${C_ERR}SOME TESTS FAILED${C_OFF}"
+exit $fail

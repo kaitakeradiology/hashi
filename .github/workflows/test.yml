@@ -1,0 +1,97 @@
+# CI: build hashi from nothing on a fresh runner and run everything a change
+# must keep green: the unit tests, every example, bench and smoke program, and
+# the API docs.
+#
+# Nimony is pre-release and moves daily, so the toolchain is pinned to one
+# commit (NIMONY_REF) and bootstrapped from a stable Nim 2. Bump the pin
+# deliberately, after tests/run passes locally against the new commit. The
+# built toolchain is cached per pin, so only a bump pays the bootstrap.
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  NIMONY_REF: d9873784ac394d1c58031dbedf77ebaf82c1335a
+  NIM_VERSION: '2.2.10'
+
+jobs:
+  suite:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out hashi
+        uses: actions/checkout@v4
+        with:
+          path: hashi
+
+      - name: Check out Nimony at the pinned commit
+        # A sibling of hashi/, which is the layout tests/run and doc/gen expect.
+        uses: actions/checkout@v4
+        with:
+          repository: nim-lang/nimony
+          ref: ${{ env.NIMONY_REF }}
+          path: nimony
+
+      - name: Install Nim 2 (bootstraps Nimony)
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ env.NIM_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore the Nimony toolchain
+        id: nimony-cache
+        uses: actions/cache@v4
+        with:
+          path: nimony/bin
+          key: nimony-bin-${{ runner.os }}-${{ env.NIMONY_REF }}-nim${{ env.NIM_VERSION }}
+
+      - name: Build the Nimony toolchain
+        if: steps.nimony-cache.outputs.cache-hit != 'true'
+        working-directory: nimony
+        run: nim c -r src/hastur/hastur --release build all
+
+      - name: Unit tests
+        working-directory: hashi
+        run: NIMONY=../nimony/bin/nimony tests/run
+
+      - name: Examples, benches and smoke programs build
+        working-directory: hashi
+        run: |
+          for f in examples/*.nim bench/bench_server.nim tests/smoke_ws_outq.nim; do
+            ../nimony/bin/nimony c "$f"
+          done
+
+      - name: Outbound-queue smoke (a live writer over a socket pair)
+        working-directory: hashi
+        run: ../nimony/bin/nimony c -r tests/smoke_ws_outq.nim
+
+      - name: WebSocket conformance over raw sockets
+        working-directory: hashi
+        run: python3 tests/conformance/ws_conformance.py "$(find nimcache -name hello -type f -perm -u+x | head -1)"
+
+      - name: API docs
+        working-directory: hashi
+        run: NIMONY=../nimony/bin/nimony doc/gen
+
+      - name: Upload the API reference for Pages
+        if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: hashi/htmldocs
+
+  pages:
+    # Publish the API reference from the suite's docs step. Needs Pages
+    # enabled on the repository with "GitHub Actions" as the source.
+    if: github.event_name == 'push'
+    needs: suite
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

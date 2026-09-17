@@ -1,0 +1,10 @@
+{
+  "_comment": "Autobahn fuzzingclient config — drives the hashi WebSocket echo server through the full RFC 6455 case suite.",
+  "outdir": "/reports",
+  "servers": [
+    { "agent": "hashi", "url": "ws://127.0.0.1:8080" }
+  ],
+  "cases": ["*"],
+  "exclude-cases": [],
+  "exclude-agent-cases": {}
+}
