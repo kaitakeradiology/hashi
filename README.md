@@ -1,8 +1,11 @@
 <p align="center">
-  <a href="https://kaitakeradiology.co.nz"><img src="doc/assets/krs-lockup.svg" width="360" alt="Kaitake Radiology Systems"></a>
+  <a href="https://kaitakeradiology.co.nz"><picture>
+    <source media="(prefers-color-scheme: dark)" srcset="doc/assets/krs-lockup-dark.svg">
+    <img src="doc/assets/krs-lockup-light.svg" width="360" alt="Kaitake Radiology Systems">
+  </picture></a>
 </p>
 
-# Hashi (橋)
+# Hashi (橋, bridge)
 
 An HTTP/1.1 and WebSocket server for [Nimony](https://github.com/nim-lang/nimony),
 the Nim 3 compiler. Handlers are `.passive` procs: sequential code that
@@ -64,15 +67,16 @@ is fuzzed and differentially tested. Results: [`doc/conformance.md`](doc/conform
 ## Performance
 
 `wrk -t10`, 10 s per run, loopback, release builds, 16-core Linux box.
-[Mummy](https://github.com/guzba/mummy), a Nim 2 server using worker threads, measured
-in the same session for scale. Method and history:
-[`doc/benchmarks.md`](doc/benchmarks.md).
+[Mummy](https://github.com/guzba/mummy), a Nim 2 server using worker threads, and
+[cps-http](https://github.com/gabearro/cps-http), a Nim 2 server using continuations
+from a macro on its own runtime, measured in the same session for scale.
+Method and full results: [`doc/benchmarks.md`](doc/benchmarks.md).
 
-| Workload | hashi | Mummy |
-|---|---|---|
-| Raw, 100 connections | 267,000 req/s, 0.47 ms | 91,000 req/s, 1.10 ms |
-| Raw, 1000 connections | 242,000 req/s, 2.9 ms | 83,000 req/s, 17.9 ms |
-| 10 ms of work per request, 1000 connections | 94,000 req/s, 10.2 ms | 9,800 req/s, 96 ms |
+| Workload | hashi | cps-http | Mummy |
+|---|---|---|---|
+| Raw, 100 connections | 276,000 req/s, 0.49 ms | 95,600 req/s, 1.28 ms | 91,800 req/s, 1.09 ms |
+| Raw, 1000 connections | 267,000 req/s, 2.55 ms | 78,100 req/s, 13.7 ms | 75,600 req/s, 24.4 ms |
+| 10 ms of work per request, 1000 connections | 95,100 req/s, 10.2 ms | 71,400 req/s, 14.0 ms | 9,700 req/s, 97.7 ms |
 
 ## Building
 
@@ -96,7 +100,9 @@ socket FFI in `src/hashi/net.nim`.
 
 ## Documentation
 
-- `doc/gen` builds the API reference into `htmldocs/` with `nimony doc`.
+- [API reference](https://kaitakeradiology.github.io/hashi/), generated from
+  the source on every push; `doc/gen` builds the same pages into `htmldocs/`
+  with `nimony doc`.
 - [`doc/api.md`](doc/api.md): how the pieces fit together.
 - [`examples/`](examples/): routing, configured limits, WebSocket echo, the
   outbound queue.
