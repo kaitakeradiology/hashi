@@ -59,19 +59,16 @@ type
   WsHandler* = proc(ws: WsConn) {.passive.}
     ## App handler. Called once per upgraded connection; owns it until it returns.
 
-var gWsHandler*: WsHandler
-  ## The registered app handler. A passive proc-value has no nil form, so
-  ## `gHasWsHandler` tracks whether it was actually set.
-var gHasWsHandler = false
+var gWsHandler*: nil WsHandler
+  ## The registered app handler; nil until `setWsHandler`.
 
 proc setWsHandler*(h: WsHandler) =
   ## Register the WebSocket handler. Call before `serve`.
   gWsHandler = h
-  gHasWsHandler = true
 
 proc hasWsHandler*(): bool =
   ## True once `setWsHandler` has been called.
-  result = gHasWsHandler
+  result = gWsHandler != nil
 
 proc newWsConn*(fd: cint; initial: string; clientIp = "";
                 cookie = ""; path = ""): WsConn =

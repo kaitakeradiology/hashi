@@ -63,10 +63,8 @@ type
     ## chains. Filled via `addRoute`/`get`/`post`/… and read by `dispatch` or
     ## `dispatchFull`.
     routes*: seq[Route]
-    errorHandler*: ErrorHandler   ## Valid only when `hasErrorHandler`.
-    hasErrorHandler*: bool
-    notFound*: Handler            ## Valid only when `hasNotFound`.
-    hasNotFound*: bool
+    errorHandler*: nil ErrorHandler   ## nil until `setErrorHandler`.
+    notFound*: nil Handler            ## nil until `setNotFound`.
     before*: seq[BeforeMiddleware]  ## Pre-dispatch chain; see `dispatchFull`.
     after*: seq[AfterMiddleware]    ## Post-dispatch chain; see `dispatchFull`.
 
@@ -154,7 +152,6 @@ proc setErrorHandler*(r: var Router; h: ErrorHandler) =
   ## Register an app error handler; a raised `ErrorCode` is passed to it for a
   ## custom `Response`. Without one, `dispatch` uses `errorCodeToHttp`.
   r.errorHandler = h
-  r.hasErrorHandler = true
 
 proc setNotFound*(r: var Router; h: Handler) =
   ## Register a fallback handler, invoked when no route matches (and no route's
@@ -163,7 +160,6 @@ proc setNotFound*(r: var Router; h: Handler) =
   ## `index.html` fallback, vs a greedy `"/**"` route which shadows any route
   ## registered after it (`matchRoute` returns the first match).
   r.notFound = h
-  r.hasNotFound = true
 
 proc addBefore*(r: var Router; m: BeforeMiddleware) =
   ## Append a pre-dispatch middleware (runs in registration order). See
@@ -189,7 +185,7 @@ proc guarded(r: Router; h: Handler; req: Request): Response =
   try:
     result = h(req)
   except ErrorCode as e:
-    if r.hasErrorHandler:
+    if r.errorHandler != nil:
       result = r.errorHandler(req, e)
     else:
       result = newResponse(errorCodeToHttp(e))
@@ -212,11 +208,13 @@ proc dispatch*(r: Router; req: Request): Response =
     result = guarded(r, r.routes[m.idx].handler, rq)
   elif m.methodMismatch:
     result = newResponse(405)
-  elif r.hasNotFound:
-    # No route matched → the registered fallback (e.g. SPA index.html).
-    result = guarded(r, r.notFound, req)
   else:
-    result = newResponse(404)
+    # No route matched → the registered fallback (e.g. SPA index.html), else 404.
+    let fallback = r.notFound
+    if fallback != nil:
+      result = guarded(r, fallback, req)
+    else:
+      result = newResponse(404)
 
 proc runBefore*(r: Router; req: Request): Opt[Response] =
   ## Run the before-chain in order; the first `some(resp)` short-circuits (and is

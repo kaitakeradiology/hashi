@@ -119,20 +119,19 @@ proc asyncHandlerCount*(): int =
 type BootTask* = proc () {.passive.}
   ## A one-shot `.passive` task run on the reactor once the listener is up,
   ## for startup work that needs the reactor (see `setBootTask`).
-var gBootTask: BootTask
-var gHasBootTask = false
+var gBootTask: nil BootTask
 
 proc setBootTask*(t: BootTask) =
   ## Register a single `.passive` task to run once on the reactor right after the
   ## listener comes up. Replaces any prior task.
   gBootTask = t
-  gHasBootTask = true
 
-proc hasBootTask*(): bool = gHasBootTask
+proc hasBootTask*(): bool = gBootTask != nil
 
 proc bootRunner() {.passive.} =
   ## Drives the registered boot task; spawned by `serve` when one is set.
-  gBootTask()
+  let t = gBootTask
+  if t != nil: t()
 
 const MaxExtraListeners* = 8
   ## Capacity of the secondary WebSocket-only listener table (`addWsListener`).

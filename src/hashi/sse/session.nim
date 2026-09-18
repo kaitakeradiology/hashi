@@ -23,24 +23,20 @@ type
   SseMatch* = proc(req: Request): bool {.nimcall.}
     ## Predicate selecting the requests served as SSE streams.
 
-# A passive proc value has no nil form, so a separate flag records whether
-# one is registered.
-var gSseHandler*: SseHandler
-var gSseMatch: SseMatch
-var gHasSse = false
+var gSseHandler*: nil SseHandler   ## nil until `setSseHandler`.
+var gSseMatch: nil SseMatch
 
 proc setSseHandler*(match: SseMatch; h: SseHandler) =
   ## Register the match predicate and the handler. Call before `serve`. There
   ## is one handler; an app with several SSE endpoints dispatches inside it.
   gSseMatch = match
   gSseHandler = h
-  gHasSse = true
 
 proc hasSseHandler*(): bool =
   ## True once `setSseHandler` has been called.
-  result = gHasSse
+  result = gSseHandler != nil
 
 proc sseMatches*(req: Request): bool =
   ## Whether `req` should be served by the registered SSE handler. False when
   ## none is registered.
-  result = gHasSse and gSseMatch(req)
+  result = gSseMatch != nil and gSseMatch(req)

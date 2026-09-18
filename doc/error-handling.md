@@ -18,7 +18,7 @@ library it calls — Nimony's I/O/DB layers report failures as `ErrorCode`s) may
 try:
   result = handler(rq)
 except ErrorCode as e:
-  result = if hasErrorHandler: errorHandler(rq, e)
+  result = if errorHandler != nil: errorHandler(rq, e)
            else: newResponse(errorCodeToHttp(e))
 ```
 

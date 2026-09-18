@@ -14,7 +14,7 @@ on:
   workflow_call:
 
 env:
-  NIMONY_REF: d9873784ac394d1c58031dbedf77ebaf82c1335a
+  NIMONY_REF: 927296de9e9b6d301c8db0b950b4581dc79c3cf0
   NIM_VERSION: '2.2.10'
 
 jobs:
