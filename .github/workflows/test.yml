@@ -11,6 +11,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 env:
   NIMONY_REF: d9873784ac394d1c58031dbedf77ebaf82c1335a

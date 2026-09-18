@@ -1,0 +1,47 @@
+# Release: a tag vX.Y.Z runs the full suite (test.yml, so the Nimony pin
+# lives in one place), checks the tag against hashi.nimble and CHANGELOG.md,
+# and publishes a GitHub Release whose notes are that version's changelog
+# entry. There is nothing to build for distribution: hashi is source, and
+# GitHub attaches the source archives to the release itself.
+name: release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  suite:
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    secrets: inherit
+
+  publish:
+    needs: suite
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag names the version in hashi.nimble
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          nimble=$(sed -n 's/^version *= *"\(.*\)"/\1/p' hashi.nimble)
+          [ "$tag" = "$nimble" ] || { echo "tag v$tag but hashi.nimble says $nimble"; exit 1; }
+
+      - name: Extract the changelog entry
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            /^## \[/ { p = ($0 ~ "^## \\[" v "\\]") }
+            p && !/^## \[/ { print }
+          ' CHANGELOG.md | sed '/./,$!d' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > notes.md
+          [ -s notes.md ] || { echo "no CHANGELOG.md entry for $version"; exit 1; }
+          cat notes.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "hashi $GITHUB_REF_NAME" --notes-file notes.md
