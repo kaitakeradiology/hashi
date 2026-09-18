@@ -14,6 +14,10 @@ notes.
   said `Connection: close`, or was HTTP/1.0) now carries `Connection: close`
   (RFC 9112 §9.6), so clients stop sending another request into a socket
   about to close.
+- The listen backlog is 4096 (was 128): under a thousand connections opening
+  and closing per request, the short queue dropped SYNs and the p99 latency
+  was the client's retransmit timer.
+
 ## [0.1.1] - 2026-09-18
 
 ### Fixed

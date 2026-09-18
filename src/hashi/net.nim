@@ -67,8 +67,12 @@ type
     err*: cint      ## `errno` of the failing call, 0 when `ok`
     stage*: string  ## the failing call: "socket", "bind", "listen" or "bindaddr"
 
-proc tryListenTcp*(port: uint16; backlog = 128; bindAddr = ""): ListenResult =
+proc tryListenTcp*(port: uint16; backlog = 4096; bindAddr = ""): ListenResult =
   ## Create a non-blocking TCP listen socket on `port`. Never asserts.
+  ##
+  ## `backlog` is the accept queue; the kernel clamps it to `somaxconn`. A
+  ## queue that is too short drops SYNs under connection churn, which the
+  ## client sees as one-second retransmit stalls rather than as an error.
   ##
   ## `bindAddr` is an address literal, never a hostname:
   ##   - `""` or `"::"`: dual-stack wildcard (an IPv6 socket with

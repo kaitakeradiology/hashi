@@ -11,7 +11,7 @@ import testkit
 
 # A high, uncommon port. SO_REUSEADDR covers a TIME_WAIT leftover from a prior
 # run; two *live* binds in one process still collide → deterministic EADDRINUSE.
-const Port = 39517'u16
+const Port = 29517'u16  # below the ephemeral range, so a client socket never holds it
 
 section "listenTcp — clean bind/listen on a free port"
 
@@ -38,7 +38,7 @@ section "listenTcp — bindAddr address-literal convention"
 # Convention (the Mummy-patch model): ""/"::" dual-stack wildcard, "::0"
 # v6-only wildcard, "0.0.0.0" v4 wildcard, any other literal = that specific
 # address; never a hostname. Distinct port per case.
-var bp = 39520'u16
+var bp = 29520'u16
 
 proc bindCase(ba: string): ListenResult =
   bp = bp + 1'u16
