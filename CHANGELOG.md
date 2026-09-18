@@ -8,6 +8,12 @@ notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- A response after which the server will close the connection (the request
+  said `Connection: close`, or was HTTP/1.0) now carries `Connection: close`
+  (RFC 9112 §9.6), so clients stop sending another request into a socket
+  about to close.
 ## [0.1.1] - 2026-09-18
 
 ### Fixed

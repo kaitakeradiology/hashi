@@ -12,6 +12,7 @@
 
 import std/syncio
 import std/times
+import std/strutils
 import std/http/httpdate
 import hashi/http/request   # Response lives alongside Request (one-hop rule)
 import testkit
@@ -20,6 +21,30 @@ const CRLF = "\r\n"
 const SRV = "Server: hashi" & CRLF
   ## Default Server header (RFC 9110 §10.2.4): emitted after the status line
   ## (and after Date when present) whenever the handler set none.
+
+# ── Connection: close on the last response ────────────────────────────
+section "closing"
+
+block:
+  # RFC 9112 §9.6: a server that closes after this response says so, so the
+  # client does not send another request into a socket about to close.
+  let r = newResponse(200, "bye")
+  let s = serialize(r, withDate = false, closing = true)
+  check s == "HTTP/1.1 200 OK" & CRLF & SRV & "Connection: close" & CRLF &
+             "Content-Length: 3" & CRLF & CRLF & "bye",
+    "closing adds Connection: close"
+
+block:
+  var r = newResponse(200, "x")
+  r.headers.add Header(name: "Connection", value: "close")
+  let s = serialize(r, withDate = false, closing = true)
+  check s == "HTTP/1.1 200 OK" & CRLF & SRV & "Connection: close" & CRLF &
+             "Content-Length: 1" & CRLF & CRLF & "x",
+    "a handler's own Connection header is not duplicated"
+
+block:
+  let s = serialize(newResponse(200, "x"), withDate = false)
+  check not s.contains("Connection:"), "no Connection header when keeping alive"
 
 # ── status line + auto Content-Length ──────────────────────────────────
 section "status line"

@@ -316,7 +316,7 @@ proc respond(c: Conn; req: Request; ip: string): bool {.passive.} =
     resp = dispatchAsync(req)
   else:
     resp = dispatchFull(appRouter, req)
-  result = writeAll(c.fd, serialize(resp, req.httpMethod))
+  result = writeAll(c.fd, serialize(resp, req.httpMethod, closing = shouldClose(req)))
   if result:
     accessLog(ip, resp.status, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
 

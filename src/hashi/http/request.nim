@@ -291,7 +291,7 @@ proc sanitizeFieldText(s: string): string =
       result.add c
 
 proc serialize*(resp: Response; httpMethod = ""; now = getTime();
-                withDate = true): string =
+                withDate = true; closing = false): string =
   ## Serialize `resp` to HTTP/1.1 wire bytes: status-line, field lines, the
   ## terminating CRLF, then the body. We are an HTTP/1.1 server, so the
   ## status-line version is always `HTTP/1.1`. The caller may supply the
@@ -308,6 +308,8 @@ proc serialize*(resp: Response; httpMethod = ""; now = getTime();
   ##     (guards keep-alive framing against a stray handler body).
   ##   - a HEAD response keeps the Content-Length it would send for GET but
   ##     omits the body (RFC 9110 §9.3.2).
+  ##   - `closing` adds `Connection: close` (RFC 9112 §9.6) when the handler
+  ##     set no Connection header: the server will close after this response.
   ##   - CR/LF are stripped from field names/values (response-splitting guard).
   let bodyless = isBodylessStatus(resp.status)
   let isHead = httpMethod == "HEAD"
@@ -315,14 +317,18 @@ proc serialize*(resp: Response; httpMethod = ""; now = getTime();
   var hasCL = false
   var hasDate = false
   var hasServer = false
+  var hasConn = false
   for h in resp.headers:
     if cmpIgnoreCase(h.name, "Content-Length") == 0: hasCL = true
     if cmpIgnoreCase(h.name, "Date") == 0: hasDate = true
     if cmpIgnoreCase(h.name, "Server") == 0: hasServer = true
+    if cmpIgnoreCase(h.name, "Connection") == 0: hasConn = true
   if withDate and not hasDate:
     result.add "Date: " & formatHttpDate(now) & CRLF
   if not hasServer:
     result.add "Server: hashi" & CRLF
+  if closing and not hasConn:
+    result.add "Connection: close" & CRLF
   for h in resp.headers:
     result.add sanitizeFieldText(h.name) & ": " & sanitizeFieldText(h.value) & CRLF
   if not hasCL and not bodyless:
