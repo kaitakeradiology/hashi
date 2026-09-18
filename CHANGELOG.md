@@ -8,6 +8,8 @@ notes.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-19
+
 ### Fixed
 
 - A response after which the server will close the connection (the request
@@ -59,6 +61,7 @@ compiler, with no dependencies beyond the Nimony standard library.
 - Conformance: the Autobahn WebSocket suite passes with no failures; a
   raw-socket WebSocket harness and seven parser fuzzers gate CI.
 
-[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/kaitakeradiology/hashi/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/kaitakeradiology/hashi/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/kaitakeradiology/hashi/releases/tag/v0.1.0
