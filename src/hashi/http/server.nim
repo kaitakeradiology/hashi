@@ -114,6 +114,13 @@ proc hasAsyncHandler*(): bool =
 
 proc asyncHandlerCount*(): int =
   ## Number of registered passive handlers.
+  ##
+  ## Kept for tests and for a consumer that wants to assert its own wiring.
+  ## `serve` used to log this at boot, back when the chain was a fixed-capacity
+  ## array that DROPPED an over-limit handler in silence — the count was how you
+  ## saw a handler go missing. The chain is an unbounded `seq` now and
+  ## registration cannot fail, so the line was narrating a healthy boot and is
+  ## gone; nothing here watches for a failure that no longer exists.
   result = gAsync.len
 
 type BootTask* = proc () {.passive.}
@@ -435,8 +442,6 @@ proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
   ignoreSigpipe()
   initLoop()
   let listenFd = listenOrQuit(port, bindAddr, "")
-  if gAsync.len > 0:
-    log(info, "hashi http: " & $gAsync.len & " async handlers registered")
   spawnTask acceptLoop(listenFd, -1)
   for e in 0 ..< gExtra.len:
     let efd = listenOrQuit(gExtra[e].port, gExtra[e].bindAddr, " (ws-only)")
