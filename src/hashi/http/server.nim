@@ -435,8 +435,6 @@ proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
   ignoreSigpipe()
   initLoop()
   let listenFd = listenOrQuit(port, bindAddr, "")
-  if gAsync.len > 0:
-    log(info, "hashi http: " & $gAsync.len & " async handlers registered")
   spawnTask acceptLoop(listenFd, -1)
   for e in 0 ..< gExtra.len:
     let efd = listenOrQuit(gExtra[e].port, gExtra[e].bindAddr, " (ws-only)")
