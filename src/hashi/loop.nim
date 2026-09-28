@@ -54,7 +54,7 @@ proc runLoop*() =
 
 template spawnTask*(call: untyped) =
   ## Start the passive proc call `call` on the pool and return at once.
-  complete(delay(call))
+  submit(delay(call))
 
 proc sleepMs*(ms: int) {.passive.} =
   ## Suspend the calling passive proc for `ms` milliseconds. To run something

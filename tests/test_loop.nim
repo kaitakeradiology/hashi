@@ -5,16 +5,18 @@
 ## into the CALLEE's coroutine frame while the caller is parked. This asserts the
 ## returned count AND the bytes over a real socketpair, ten times.
 ##
-## NOTE main must `pumpIo` its OWN lane: `spawn` submits a task's first op on the
-## calling thread's lane, and a lane is drained only by that thread (sched.nim
-## runLoop/pumpIo). Sleeping instead simply hangs, with no error.
-import std/syncio
+## `spawnTask` queues the task on the pool, so its ops run on worker lanes; main
+## pumps its own lane while it waits, as `runLoop` would.
+import std/[syncio, monotimes]
 from std/posix/posix import write, close
 import hashi/loop     # imported, not included
 import testkit
 
 proc cSocketpair(domain, typ, protocol: cint; sv: ptr cint): cint {.
   importc: "socketpair", header: "<sys/socket.h>".}
+proc cAlarm(seconds: cuint): cuint {.importc: "alarm", header: "<unistd.h>".}
+  ## The watchdog: a `spawnTask` that waits for its task can wait forever here,
+  ## and SIGALRM turns that hang into a failed run.
 const AfUnix = 1.cint
 const SockStream = 1.cint
 
@@ -27,8 +29,32 @@ proc reader(fd: cint) {.passive.} =
   gGot = waitRead(fd, addr gBuf[0], 64)
   gDone = true
 
+var gNapDone = false
+
+proc napper() {.passive.} =
+  ## Parks on a ring timer, so a caller that waits for it waits 200 ms.
+  sleepMs(200)
+  gNapDone = true
+
+proc spawnReturnsAtOnce() =
+  ## `spawnTask` starts the task and returns; it does not wait for the task to
+  ## finish. An accept loop spawns each connection's handler this way, so a
+  ## `spawnTask` that waited would serve one connection at a time.
+  let t0 = getMonoTime().ticks
+  spawnTask napper()
+  let spentMs = (getMonoTime().ticks - t0) div 1_000_000
+  var spins = 0
+  while not gNapDone and spins < 200:
+    discard pumpIo(10)
+    spins = spins + 1
+  section "spawnTask returns while the task is parked"
+  check spentMs < 100, "spawnTask returned in " & $spentMs & " ms (the task parks for 200)"
+  check gNapDone, "the spawned task still ran to the end"
+
 proc main() =
+  discard cAlarm(10)
   initLoop()
+  spawnReturnsAtOnce()
   var ok = 0
   var i = 0
   while i < 10:
