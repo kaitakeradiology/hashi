@@ -5,8 +5,8 @@
 ## it from worker threads thereafter. Because it is set before `serve` and
 ## only read during serving, no lock is needed.
 ##
-## Worker-thread count is not configured here: it is `std/threadpool`'s
-## compile-time `WorkerCount`.
+## Worker-thread count is not configured here: `std/threadpool.initPool`
+## sizes the pool at run time, one worker fewer than `countProcessors()`.
 
 import hashi/http/request
 import hashi/ws/frame
