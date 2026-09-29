@@ -8,6 +8,16 @@ notes.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-29
+
+### Fixed
+
+- `spawnTask` returns once the task is queued. On Nimony at and after
+  nim-lang/nimony#2569, where a regular proc's call of a `.passive` proc
+  runs it to completion, it waited for the task to finish, so the accept
+  loop served one keep-alive connection at a time (about 96k req/s against
+  570k). CI is pinned to `564d789e`.
+
 ## [0.1.2] - 2026-09-19
 
 ### Fixed
@@ -61,7 +71,8 @@ compiler, with no dependencies beyond the Nimony standard library.
 - Conformance: the Autobahn WebSocket suite passes with no failures; a
   raw-socket WebSocket harness and seven parser fuzzers gate CI.
 
-[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/kaitakeradiology/hashi/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/kaitakeradiology/hashi/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/kaitakeradiology/hashi/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/kaitakeradiology/hashi/releases/tag/v0.1.0
