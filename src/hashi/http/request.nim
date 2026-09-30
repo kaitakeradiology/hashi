@@ -305,6 +305,12 @@ proc addDateLine(s: var string; now: Time) =
     tDateSec = sec
   s.add tDateLine
 
+proc addFieldText(s: var string; t: string) =
+  ## Append `t` to `s` through `sanitizeFieldText`'s guard, copying it whole
+  ## when there is no CR or LF to strip.
+  if find(t, {'\r', '\n'}) < 0: s.add t
+  else: s.add sanitizeFieldText(t)
+
 proc serialize*(resp: Response; httpMethod = ""; now = getTime();
                 withDate = true; closing = false): string =
   ## Serialize `resp` to HTTP/1.1 wire bytes: status-line, field lines, the
@@ -328,7 +334,12 @@ proc serialize*(resp: Response; httpMethod = ""; now = getTime();
   ##   - CR/LF are stripped from field names/values (response-splitting guard).
   let bodyless = isBodylessStatus(resp.status)
   let isHead = httpMethod == "HEAD"
-  result = "HTTP/1.1 " & $resp.status & " " & resp.reason & CRLF
+  result = newStringOfCap(160 + resp.body.len)
+  result.add "HTTP/1.1 "
+  result.add $resp.status
+  result.add ' '
+  result.add resp.reason
+  result.add CRLF
   var hasCL = false
   var hasDate = false
   var hasServer = false
@@ -341,14 +352,19 @@ proc serialize*(resp: Response; httpMethod = ""; now = getTime();
   if withDate and not hasDate:
     result.addDateLine(now)
   if not hasServer:
-    result.add "Server: hashi" & CRLF
+    result.add "Server: hashi\r\n"
   if closing and not hasConn:
-    result.add "Connection: close" & CRLF
+    result.add "Connection: close\r\n"
   for h in resp.headers:
-    result.add sanitizeFieldText(h.name) & ": " & sanitizeFieldText(h.value) & CRLF
+    result.addFieldText h.name
+    result.add ": "
+    result.addFieldText h.value
+    result.add CRLF
   if not hasCL and not bodyless:
     # Content-Length is the body's length even for HEAD (the would-be GET body).
-    result.add "Content-Length: " & $resp.body.len & CRLF
+    result.add "Content-Length: "
+    result.add $resp.body.len
+    result.add CRLF
   result.add CRLF
   if not bodyless and not isHead:
     result.add resp.body
