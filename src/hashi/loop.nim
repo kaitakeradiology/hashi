@@ -24,7 +24,7 @@ import std/ioring
 export ioring
 
 when defined(posix):
-  from std/posix/posix import write, pcall, EAGAIN, EINTR, IOVec
+  from std/posix/posix import read, write, pcall, EAGAIN, EINTR, IOVec
   proc cWritev(fd: cint; iov: pointer; iovcnt: cint): int {.importc: "writev".}
     ## `iov` points at `IOVec`s, which have `struct iovec`'s layout.
   proc usleepMicroseconds(usec: cuint): cint {.importc: "usleep", header: "<unistd.h>".}
@@ -97,6 +97,27 @@ proc waitWrite*(fd: cint; buf: pointer; len: int): int {.passive.} =
   let c = delay()
   discard submitWrite(fd, buf, len, never, c, addr result)
   suspend()
+
+const ReadLater* = -2
+  ## `readNow`'s answer when nothing has arrived yet.
+
+proc readNow*(fd: cint; buf: pointer; len: int): int =
+  ## Read what has already arrived on the non-blocking `fd` into `buf`, up to
+  ## `len` bytes, without waiting. Returns the bytes read, 0 when the peer
+  ## has closed, -1 on an error, or `ReadLater` when nothing is there yet.
+  ## Where there is no direct read (Windows) it always returns `ReadLater`.
+  result = ReadLater
+  when defined(posix):
+    var done = false
+    while not done:
+      let n = pcall(read(fd, buf, len))
+      if n >= 0:
+        result = int(n)
+        done = true
+      elif n == -clong(EAGAIN): done = true
+      elif n != -clong(EINTR):
+        result = -1
+        done = true
 
 proc writeNow*(fd: cint; data: string; off: int): int =
   ## Write as much of `data[off ..]` to the non-blocking `fd` as the kernel

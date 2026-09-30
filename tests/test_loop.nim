@@ -82,8 +82,29 @@ proc mainTakesTurns() =
   check atomicLoad(gProbeOnMain, moAcquire) == 1,
     "with all " & $workerCount & " workers busy, the main thread ran the task"
 
+proc readNowCases() =
+  ## `readNow` reads what has arrived without waiting, and says when nothing
+  ## has.
+  var sv = default(array[2, cint])
+  discard cSocketpair(AfUnix, SockStream, 0.cint, addr sv[0])
+  setNonBlocking(sv[0])
+  setNonBlocking(sv[1])
+  var buf = default(array[64, char])
+  section "readNow"
+  check readNow(sv[0], addr buf[0], buf.len) == ReadLater, "nothing sent: ReadLater"
+  var msg = default(array[5, char])
+  msg[0] = 'h'; msg[1] = 'e'; msg[2] = 'l'; msg[3] = 'l'; msg[4] = 'o'
+  discard write(sv[1], addr msg[0], 5)
+  check readNow(sv[0], addr buf[0], buf.len) == 5 and buf[0] == 'h' and buf[4] == 'o',
+    "what arrived is read at once"
+  check readNow(sv[0], addr buf[0], buf.len) == ReadLater, "then ReadLater again"
+  discard close(sv[1])
+  check readNow(sv[0], addr buf[0], buf.len) == 0, "a closed peer reads 0"
+  discard close(sv[0])
+
 proc main() =
   discard cAlarm(10)
+  readNowCases()
   initLoop()
   spawnReturnsAtOnce()
   mainTakesTurns()

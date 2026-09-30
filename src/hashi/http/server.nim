@@ -186,10 +186,14 @@ proc timedRead(c: Conn): int {.passive.} =
   ## TCP flow control a slow-but-alive reader is indistinguishable from a
   ## stalled one, and dead-peer detection on the write side is
   ## `TCP_USER_TIMEOUT`'s job (see `setKeepalive`).
-  let w = gServerConfig.idleTimeoutMs
-  if w > 0: setDeadline(c.fd, getMonoTime().ticks + w.int64 * 1_000_000'i64)
-  result = waitRead(c.fd, addr c.rbuf[0], c.rbuf.len)
-  if w > 0: setDeadline(c.fd, 0'i64)
+  ## Bytes that have already arrived are read at once; only an empty socket
+  ## parks on the ring.
+  result = readNow(c.fd, addr c.rbuf[0], c.rbuf.len)
+  if result == ReadLater:
+    let w = gServerConfig.idleTimeoutMs
+    if w > 0: setDeadline(c.fd, getMonoTime().ticks + w.int64 * 1_000_000'i64)
+    result = waitRead(c.fd, addr c.rbuf[0], c.rbuf.len)
+    if w > 0: setDeadline(c.fd, 0'i64)
   if result > 0: appendBytes(c.acc, addr c.rbuf[0], result)
 
 proc reject(c: Conn; status: int) {.passive.} =
