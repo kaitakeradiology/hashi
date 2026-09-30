@@ -191,4 +191,33 @@ block:
   check not eqIgnoreCase("Host", "Hosts"), "a prefix is not a match"
   check not eqIgnoreCase("@", "`"), "only A-Z fold: '@' and '`' differ"
 
+# ── clear and in-place parsing: a reused Request carries nothing over ──
+section "a reused Request"
+
+block:
+  var r = default(Request)
+  r.httpMethod = "POST"
+  r.target = "/t"
+  r.version = Http10
+  r.headers = @[Header(name: "A", value: "1"), Header(name: "B", value: "2")]
+  r.headBytes = 99
+  r.body = "body"
+  r.pathParams = @[PathParam(key: "id", val: "7")]
+  r.remoteAddress = "10.0.0.1"
+  r.startNanos = 5
+  clear(r)
+  check r.httpMethod == "" and r.target == "" and r.version == default(HttpVersion) and
+        r.headers.len == 0 and r.headBytes == 0 and r.body == "" and
+        r.pathParams.len == 0 and r.remoteAddress == "" and r.startNanos == 0,
+    "clear leaves every field at its default"
+
+block:
+  var r = default(Request)
+  check parseRequestHead("GET /a HTTP/1.1\r\nHost: h\r\nX-One: 1\r\nX-Two: 2\r\n\r\n", r) == psOk,
+    "a first request parses"
+  clear(r)
+  check parseRequestHead("GET /b HTTP/1.1\r\nHost: h\r\n\r\n", r) == psOk, "the next parses"
+  check r.headers.len == 1 and nameAt(r, 0) == "Host" and r.target == "/b",
+    "only the second request's headers remain"
+
 finish()

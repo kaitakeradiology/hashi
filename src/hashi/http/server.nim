@@ -199,7 +199,7 @@ proc reject(c: Conn; status: int) {.passive.} =
 proc awaitHead(c: Conn): HeadOutcome {.passive.} =
   ## Read until a full request head is buffered into `c.req`, or the peer
   ## closes, or the head exceeds `maxRequestHead` without terminating.
-  c.req = default(Request)
+  clear(c.req)
   var st = parseRequestHead(c.acc, c.req)
   while st == psIncomplete and c.acc.len <= gServerConfig.maxRequestHead:
     if timedRead(c) <= 0: return hoClosed

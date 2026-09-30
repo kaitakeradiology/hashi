@@ -134,24 +134,34 @@ proc eqIgnoreCase*(a, b: string): bool =
     if a[i] != b[i] and toLowerAscii(a[i]) != toLowerAscii(b[i]): return false
   result = true
 
-proc parseField(line: string; h: var Header): bool =
-  ## RFC 9112 §5: `field-name ":" OWS field-value OWS`, where field-name is a
-  ## token (RFC 9110 §5.6.2: 1*tchar) — so no whitespace (smuggling defense)
-  ## and no other non-tchar bytes are permitted before the colon. Returns
-  ## false on a malformed line.
+proc parseField(data: string; a, b: int; h: var Header): bool =
+  ## Parse the field line `data[a ..< b]`. RFC 9112 §5:
+  ## `field-name ":" OWS field-value OWS`, where field-name is a token
+  ## (RFC 9110 §5.6.2: 1*tchar) — so no whitespace (smuggling defense) and no
+  ## other non-tchar bytes are permitted before the colon. Returns false on
+  ## a malformed line.
   result = false
-  let colon = find(line, ':')
-  if colon <= 0:
+  let colon = if b > a: find(data, ':', a, b - 1) else: -1
+  if colon <= a:
     return false                      # no colon, or empty field name
-  let name = substr(line, 0, colon - 1)
+  let name = substr(data, a, colon - 1)
   if not isToken(name):
     return false                      # non-token field-name byte (incl. WS)
   var vs = colon + 1
-  var ve = line.len
-  while vs < ve and isOWS(line[vs]): inc vs
-  while ve > vs and isOWS(line[ve-1]): dec ve
-  h = Header(name: name, value: substr(line, vs, ve - 1))
+  var ve = b
+  while vs < ve and isOWS(data[vs]): inc vs
+  while ve > vs and isOWS(data[ve-1]): dec ve
+  h = Header(name: name, value: substr(data, vs, ve - 1))
   result = true
+
+proc clear*(req: var Request) =
+  ## Reset `req` to `default(Request)` for the next request on a connection,
+  ## keeping the storage `headers` has grown so that parsing refills it
+  ## rather than allocating again.
+  var keep = move req.headers
+  req = default(Request)
+  keep.setLen(0)
+  req.headers = move keep
 
 proc parseRequestHead*(data: string; req: var Request): ParseStatus =
   ## Parse the request line and field block from the front of `data`.
@@ -160,7 +170,8 @@ proc parseRequestHead*(data: string; req: var Request): ParseStatus =
   ## the consumed head up to and including the terminating CRLFCRLF) when
   ## the full head is present; `psIncomplete` if the terminating CRLFCRLF
   ## has not arrived yet; `psError` if the bytes seen so far are already
-  ## invalid (bad method/target/version, malformed field line, etc.).
+  ## invalid (bad method/target/version, malformed field line, etc.). On
+  ## `psError`, `req.headers` may hold the fields parsed before the error.
   result = psError
 
   let headEnd = findCrlfCrlf(data, 0)
@@ -190,22 +201,23 @@ proc parseRequestHead*(data: string; req: var Request): ParseStatus =
   if not isToken(meth) or target.len == 0 or version == HttpUnknown:
     return psError                     # method must be a token (§3.1)
 
-  # Field block: lines between the request line and the CRLFCRLF (§5).
-  var headers = default(seq[Header])
+  # Field block: lines between the request line and the CRLFCRLF (§5),
+  # parsed into `req.headers` in place so a reused request keeps its storage.
+  req.headers.setLen(0)
   var pos = lineEnd + 2
   while pos < headEnd:
     let fEnd = findCrlf(data, pos, headEnd + 1)
     let lim = if fEnd < 0: headEnd else: fEnd
     var h = default(Header)
-    if not parseField(substr(data, pos, lim - 1), h):
+    if not parseField(data, pos, lim, h):
       return psError
-    headers.add h
+    req.headers.add h
     pos = lim + 2
 
   # Host (RFC 9112 §3.2): an HTTP/1.1 request must carry exactly one; more
   # than one is invalid — a request-routing ambiguity / smuggling vector.
   var hostCount = 0
-  for h in headers:
+  for h in req.headers:
     if eqIgnoreCase(h.name, "Host"): inc hostCount
   if hostCount > 1: return psError
   if version == Http11 and hostCount == 0: return psError
@@ -213,7 +225,6 @@ proc parseRequestHead*(data: string; req: var Request): ParseStatus =
   req.httpMethod = meth
   req.target = target
   req.version = version
-  req.headers = headers
   req.headBytes = headEnd + 4
   result = psOk
 
