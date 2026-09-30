@@ -126,6 +126,14 @@ proc isToken(s: string): bool =
     if not isTchar(c): return false
   result = true
 
+proc eqIgnoreCase*(a, b: string): bool =
+  ## `cmpIgnoreCase(a, b) == 0`: equal up to ASCII case, which is how field
+  ## names and tokens compare. Strings of different length differ at once.
+  if a.len != b.len: return false
+  for i in 0 ..< a.len:
+    if a[i] != b[i] and toLowerAscii(a[i]) != toLowerAscii(b[i]): return false
+  result = true
+
 proc parseField(line: string; h: var Header): bool =
   ## RFC 9112 §5: `field-name ":" OWS field-value OWS`, where field-name is a
   ## token (RFC 9110 §5.6.2: 1*tchar) — so no whitespace (smuggling defense)
@@ -198,7 +206,7 @@ proc parseRequestHead*(data: string; req: var Request): ParseStatus =
   # than one is invalid — a request-routing ambiguity / smuggling vector.
   var hostCount = 0
   for h in headers:
-    if cmpIgnoreCase(h.name, "Host") == 0: inc hostCount
+    if eqIgnoreCase(h.name, "Host"): inc hostCount
   if hostCount > 1: return psError
   if version == Http11 and hostCount == 0: return psError
 
@@ -254,19 +262,19 @@ proc header*(req: Request; name: string): string =
   ## First header value for `name` (case-insensitive), or "" if absent.
   result = ""
   for h in req.headers:
-    if cmpIgnoreCase(h.name, name) == 0: return h.value
+    if eqIgnoreCase(h.name, name): return h.value
 
 proc headers*(req: Request; name: string): seq[string] =
   ## All header values for `name` (case-insensitive), in received order.
   result = @[]
   for h in req.headers:
-    if cmpIgnoreCase(h.name, name) == 0: result.add h.value
+    if eqIgnoreCase(h.name, name): result.add h.value
 
 proc hasHeader*(req: Request; name: string): bool =
   ## Whether a header named `name` (case-insensitive) is present.
   result = false
   for h in req.headers:
-    if cmpIgnoreCase(h.name, name) == 0: return true
+    if eqIgnoreCase(h.name, name): return true
 
 proc newResponse*(status: int; body = ""): Response =
   ## A response with the conventional reason phrase for `status` and no
@@ -345,10 +353,10 @@ proc serialize*(resp: Response; httpMethod = ""; now = getTime();
   var hasServer = false
   var hasConn = false
   for h in resp.headers:
-    if cmpIgnoreCase(h.name, "Content-Length") == 0: hasCL = true
-    if cmpIgnoreCase(h.name, "Date") == 0: hasDate = true
-    if cmpIgnoreCase(h.name, "Server") == 0: hasServer = true
-    if cmpIgnoreCase(h.name, "Connection") == 0: hasConn = true
+    if eqIgnoreCase(h.name, "Content-Length"): hasCL = true
+    if eqIgnoreCase(h.name, "Date"): hasDate = true
+    if eqIgnoreCase(h.name, "Server"): hasServer = true
+    if eqIgnoreCase(h.name, "Connection"): hasConn = true
   if withDate and not hasDate:
     result.addDateLine(now)
   if not hasServer:
@@ -397,12 +405,12 @@ proc bodyFraming*(req: Request): BodyInfo =
   var teChunked = false
   var teOther = false
   for h in req.headers:
-    if cmpIgnoreCase(h.name, "Content-Length") == 0:
+    if eqIgnoreCase(h.name, "Content-Length"):
       inc clCount
       clValue = parseContentLength(h.value)
-    elif cmpIgnoreCase(h.name, "Transfer-Encoding") == 0:
+    elif eqIgnoreCase(h.name, "Transfer-Encoding"):
       inc teCount
-      if cmpIgnoreCase(h.value, "chunked") == 0:
+      if eqIgnoreCase(h.value, "chunked"):
         teChunked = true
       else:
         teOther = true

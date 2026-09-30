@@ -246,9 +246,9 @@ proc shouldClose(req: Request): bool =
   ## An explicit `Connection` header wins; otherwise HTTP/1.1 keeps alive and
   ## HTTP/1.0 closes (RFC 9112 §9.3).
   for h in req.headers:
-    if cmpIgnoreCase(h.name, "Connection") == 0:
-      if cmpIgnoreCase(h.value, "close") == 0: return true
-      if cmpIgnoreCase(h.value, "keep-alive") == 0: return false
+    if eqIgnoreCase(h.name, "Connection"):
+      if eqIgnoreCase(h.value, "close"): return true
+      if eqIgnoreCase(h.value, "keep-alive"): return false
   result = req.version == Http10
 
 proc echoHandler(ws: WsConn) {.passive.} =

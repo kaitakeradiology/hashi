@@ -9,7 +9,7 @@
 ## the psOk cases fail until the parser is implemented — that's the point
 ## (TDD: red before green).
 
-import std/syncio
+import std/[syncio, strutils]
 import hashi/http/request
 import testkit
 
@@ -159,5 +159,36 @@ block:
 block:
   let (st, _) = parse("GET / HTTP/1.0" & CRLF & "Host: a" & CRLF & "Host: b" & CRLF & CRLF)
   check st == psError, "duplicate Host rejected even on HTTP/1.0"
+
+# ── eqIgnoreCase: cmpIgnoreCase(a, b) == 0, rejecting on length first ──
+var gSeed = 0x9E3779B9'u32
+proc rnd(n: int): int =
+  ## xorshift32: a fixed, reproducible sequence.
+  gSeed = gSeed xor (gSeed shl 13)
+  gSeed = gSeed xor (gSeed shr 17)
+  gSeed = gSeed xor (gSeed shl 5)
+  int(gSeed mod uint32(n))
+
+proc word(n: int): string =
+  const alphabet = "aAbB-zZ@[`{0"
+  result = ""
+  for i in 0 ..< n: result.add alphabet[rnd(alphabet.len)]
+
+section "eqIgnoreCase agrees with cmpIgnoreCase"
+block:
+  var mismatches = 0
+  for round in 0 ..< 4000:
+    let a = word(rnd(6))
+    # Half the pairs are `a` re-cased, so equal-length matches are common.
+    var b = ""
+    if rnd(2) == 0:
+      for c in a: b.add (if rnd(2) == 0: toUpperAscii(c) else: toLowerAscii(c))
+    else:
+      b = word(rnd(6))
+    if eqIgnoreCase(a, b) != (cmpIgnoreCase(a, b) == 0): inc mismatches
+  check mismatches == 0, $mismatches & " mismatches in 4000 random pairs"
+  check eqIgnoreCase("Content-Length", "content-length"), "names match across case"
+  check not eqIgnoreCase("Host", "Hosts"), "a prefix is not a match"
+  check not eqIgnoreCase("@", "`"), "only A-Z fold: '@' and '`' differ"
 
 finish()

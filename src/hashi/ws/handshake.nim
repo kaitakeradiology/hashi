@@ -21,13 +21,13 @@ proc listHasToken(v: string; token: string): bool =
   ## Is `token` (case-insensitive) a member of the comma-separated list `v`?
   result = false
   for part in split(v, ','):
-    if cmpIgnoreCase(strip(part), token) == 0: return true
+    if eqIgnoreCase(strip(part), token): return true
 
 proc isWebSocketUpgrade*(req: Request): bool =
   ## A valid RFC 6455 §4.1 client opening handshake: GET, `Upgrade: websocket`,
   ## `Connection` list containing `upgrade`, version 13, and a key present.
   result = req.httpMethod == "GET" and
-           cmpIgnoreCase(header(req, "Upgrade"), "websocket") == 0 and
+           eqIgnoreCase(header(req, "Upgrade"), "websocket") and
            listHasToken(header(req, "Connection"), "upgrade") and
            header(req, "Sec-WebSocket-Version") == "13" and
            header(req, "Sec-WebSocket-Key").len > 0
