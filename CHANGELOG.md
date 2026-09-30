@@ -8,6 +8,30 @@ notes.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-10-01
+
+### Added
+
+- `workTurn` (`hashi/loop`): one worker's turn on the calling thread, pool
+  tasks and then the thread's own lane.
+- `writeNow` (`hashi/loop`): a direct non-blocking write of what the kernel
+  takes without waiting.
+- `findCrlf` and `findCrlfCrlf` (`hashi/buffer`), `eqIgnoreCase`
+  (`hashi/http/request`), `isTrustedProxy` (`hashi/http/forwarded`).
+
+### Changed
+
+- `runLoop` takes worker turns, so the thread that runs the server works
+  alongside the pool instead of leaving a CPU idle.
+- `writeAll` writes what the socket buffer takes at once and waits on the
+  ring only for the rest.
+- The request path does less per request: line ends are found with
+  `memchr`, the `Date` line is formatted once a second per thread, the
+  response is built in one presized string, a direct peer's client address
+  is settled once per connection, and field names are compared with a
+  length check first. On 4 CPUs, plaintext keep-alive throughput is 20–38%
+  higher than 0.1.3, with p99 latency the same or lower.
+
 ## [0.1.3] - 2026-09-29
 
 ### Fixed
@@ -71,7 +95,8 @@ compiler, with no dependencies beyond the Nimony standard library.
 - Conformance: the Autobahn WebSocket suite passes with no failures; a
   raw-socket WebSocket harness and seven parser fuzzers gate CI.
 
-[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/kaitakeradiology/hashi/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/kaitakeradiology/hashi/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/kaitakeradiology/hashi/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/kaitakeradiology/hashi/compare/v0.1.0...v0.1.1
