@@ -222,4 +222,35 @@ block:
   check plain.dispatchFull(reqOf("GET", "/nope")).status == 404,
         "no middleware -> plain dispatch (404)"
 
+# ── route: dispatchFull on a request the caller owns ──────────────────────
+section "route"
+
+proc paramCount(req: Request): Response {.nimcall, raises.} =
+  newResponse(200, "params=" & $req.pathParams.len)
+
+block:
+  var rr = default(Router)
+  rr.get("/", h1)
+  rr.get("/user/:id", echoId)
+  rr.setNotFound(paramCount)
+  var mismatches = 0
+  for t in ["/", "/user/7", "/user/abc", "/missing", "/user"]:
+    for m in ["GET", "HEAD", "POST"]:
+      var owned = reqOf(m, t)
+      let a = route(rr, owned)
+      let b = dispatchFull(rr, reqOf(m, t))
+      if a.status != b.status or a.body != b.body: inc mismatches
+  check mismatches == 0, "route and dispatchFull agree on every request"
+
+block:
+  # The driver reuses one Request per connection: a match's path params
+  # must not leak into the next request's fallback.
+  var rr = default(Router)
+  rr.get("/user/:id", echoId)
+  rr.setNotFound(paramCount)
+  var req = reqOf("GET", "/user/42")
+  check route(rr, req).body == "42", "the first request gets its param"
+  req.target = "/nope"
+  check route(rr, req).body == "params=0", "the next request's fallback sees none"
+
 finish()

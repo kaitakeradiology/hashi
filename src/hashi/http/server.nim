@@ -339,7 +339,7 @@ proc respond(c: Conn; req: Request; ip: string): bool {.passive.} =
   if hasAsyncHandler():
     resp = dispatchAsync(req)
   else:
-    resp = dispatchFull(appRouter, req)
+    resp = route(appRouter, c.req)
   result = sendResponse(c, resp, req.httpMethod, shouldClose(req))
   if result:
     accessLog(ip, resp.status, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))

@@ -190,22 +190,19 @@ proc guarded(r: Router; h: Handler; req: Request): Response =
     else:
       result = newResponse(errorCodeToHttp(e))
 
-proc dispatch*(r: Router; req: Request): Response =
-  ## Route `req` to its handler (with captured path params), `405 Method Not
-  ## Allowed` if the path matched but the method didn't, else `404 Not Found`.
-  ## A handler that `raise`s an `ErrorCode` is caught here → the app error
-  ## handler if set, else `newResponse(errorCodeToHttp(e))`. (Defects/panics
-  ## are not catchable — see `Handler`.)
+proc dispatchIn(r: Router; req: var Request): Response =
+  ## `dispatch` on a request the caller owns: the matched route's captured
+  ## params are stored in `req.pathParams`, which is left empty otherwise.
   var m = matchRoute(r, req.httpMethod, req.target)
   # HEAD is mandatory for any GET resource (RFC 9110 §9.1): when no explicit
   # HEAD route matched, fall back to the GET handler. The body it returns is
   # suppressed on the wire by `serialize` (the driver passes httpMethod="HEAD").
   if not m.found and req.httpMethod == "HEAD":
     m = matchRoute(r, "GET", req.target)
+  req.pathParams.setLen(0)
   if m.found:
-    var rq = req
-    rq.pathParams = m.params
-    result = guarded(r, r.routes[m.idx].handler, rq)
+    req.pathParams = move m.params
+    result = guarded(r, r.routes[m.idx].handler, req)
   elif m.methodMismatch:
     result = newResponse(405)
   else:
@@ -215,6 +212,16 @@ proc dispatch*(r: Router; req: Request): Response =
       result = guarded(r, fallback, req)
     else:
       result = newResponse(404)
+
+proc dispatch*(r: Router; req: Request): Response =
+  ## Route `req` to its handler (with captured path params), `405 Method Not
+  ## Allowed` if the path matched but the method didn't, else `404 Not Found`.
+  ## A handler that `raise`s an `ErrorCode` is caught here → the app error
+  ## handler if set, else `newResponse(errorCodeToHttp(e))`. (Defects/panics
+  ## are not catchable — see `Handler`.) The handler sees a copy of `req`
+  ## carrying the params; `route` avoids the copy.
+  var rq = req
+  result = dispatchIn(r, rq)
 
 proc runBefore*(r: Router; req: Request): Opt[Response] =
   ## Run the before-chain in order; the first `some(resp)` short-circuits (and is
@@ -228,7 +235,7 @@ proc runBefore*(r: Router; req: Request): Opt[Response] =
       return sc
   result = none[Response]()
 
-proc runAfter*(r: Router; req: Request; resp: Response): Response =
+proc runAfter*(r: Router; req: Request; resp: sink Response): Response =
   ## Thread `resp` through the after-chain in order.
   result = resp
   for i in 0 ..< r.after.len:
@@ -245,3 +252,15 @@ proc dispatchFull*(r: Router; req: Request): Response =
     result = runAfter(r, req, sc.get(default(Response)))
   else:
     result = runAfter(r, req, dispatch(r, req))
+
+proc route*(r: Router; req: var Request): Response =
+  ## `dispatchFull` for a request the caller owns: rather than copying the
+  ## request to attach them, the matched route's params are stored in
+  ## `req.pathParams`, and cleared first so a reused request carries none
+  ## over. The connection driver serves each request this way.
+  req.pathParams.setLen(0)
+  let sc = runBefore(r, req)
+  if sc.isSome:
+    result = runAfter(r, req, sc.get(default(Response)))
+  else:
+    result = runAfter(r, req, dispatchIn(r, req))
