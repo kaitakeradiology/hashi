@@ -343,6 +343,10 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
   ## upgrade is served and anything else gets 426. Every path ends at the
   ## close at the bottom.
   let c = Conn(fd: fd, peer: peerAddress(fd), acc: "", req: default(Request))
+  # Only a trusted proxy's forwarded headers change the client address, so
+  # for any other peer it is settled here rather than per request.
+  let viaProxy = isTrustedProxy(c.peer)
+  let peerIp = if viaProxy: "" else: attributedClientIp(c.peer, "", "")
   var keepGoing = true
   while keepGoing:
     keepGoing = false
@@ -351,7 +355,7 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
     of hoTooBig: reject(c, 431)
     of hoBad: reject(c, 400)
     of hoOk:
-      let ip = clientIp(c.req, c.peer)
+      let ip = if viaProxy: clientIp(c.req, c.peer) else: peerIp
       if isWebSocketUpgrade(c.req):
         if extraIdx >= 0:
           # Socket peer and attributed client differ behind a proxy; if they

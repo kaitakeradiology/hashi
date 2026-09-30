@@ -16,6 +16,15 @@ setTrustedProxies(@["127.0.0.1"])
 block: check attributedClientIp("9.9.9.9", "1.2.3.4", "6.6.6.6") == "9.9.9.9",
   "peer not in trusted list → headers ignored"
 
+# isTrustedProxy is the gate the server checks once per connection.
+section "isTrustedProxy"
+setTrustedProxies(@["127.0.0.1"])
+block: check isTrustedProxy("127.0.0.1"), "a listed proxy is trusted"
+block: check not isTrustedProxy("9.9.9.9"), "any other peer is not"
+setTrustedProxies(@[])
+block: check not isTrustedProxy("127.0.0.1"), "an empty list trusts no one"
+setTrustedProxies(@["127.0.0.1"])
+
 # X-Real-IP is authoritative when the peer is trusted.
 section "X-Real-IP authority"
 block: check attributedClientIp("127.0.0.1", "203.0.113.5", "6.6.6.6, 127.0.0.1") == "203.0.113.5",

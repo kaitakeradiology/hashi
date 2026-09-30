@@ -21,12 +21,18 @@ proc setTrustedProxies*(proxies: seq[string]) =
   ## peer is authoritative. Call before `serve`.
   gTrustedProxies = proxies
 
+proc isTrustedProxy*(peer: string): bool =
+  ## Whether forwarded headers from the socket `peer` are honoured. For any
+  ## other peer the attributed address is the peer itself, whatever the
+  ## request's headers say, so a server can settle it once per connection.
+  peer in gTrustedProxies
+
 proc attributedClientIp*(peer, xRealIp, xForwardedFor: string): string =
   ## The client IP given the socket `peer` and the two forwarded headers,
   ## under the rules in the module doc. Exported for testing; `clientIp` is
   ## the `Request` wrapper.
   result = peer
-  if peer in gTrustedProxies:
+  if isTrustedProxy(peer):
     let xr = strip(xRealIp)
     if xr.len > 0:
       result = xr
