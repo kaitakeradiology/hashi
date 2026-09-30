@@ -24,6 +24,7 @@ import std/ioring
 export ioring
 
 when defined(posix):
+  from std/posix/posix import write, pcall, EAGAIN, EINTR
   proc usleepMicroseconds(usec: cuint): cint {.importc: "usleep", header: "<unistd.h>".}
 else:
   import std/windows/winlean
@@ -95,13 +96,29 @@ proc waitWrite*(fd: cint; buf: pointer; len: int): int {.passive.} =
   discard submitWrite(fd, buf, len, never, c, addr result)
   suspend()
 
-proc writeAll*(fd: cint; data: string): bool {.passive.} =
-  ## Write all of `data` to `fd`, handling short writes; false once the
-  ## peer is gone. Copies through a fixed buffer, since a string is not
-  ## addressable across a suspension.
+proc writeNow*(fd: cint; data: string; off: int): int =
+  ## Write as much of `data[off ..]` to the non-blocking `fd` as the kernel
+  ## takes without waiting. Returns the bytes written, 0 when it took none
+  ## (a full socket buffer), or -1 on an error such as a closed peer. Where
+  ## there is no direct write (Windows), it writes nothing and returns 0.
+  result = 0
+  when defined(posix):
+    var done = false
+    while not done and off + result < data.len:
+      let n = pcall(write(fd, readRawData(data, off + result), data.len - off - result))
+      if n > 0: result = result + int(n)
+      elif n == -clong(EINTR): discard
+      elif n == -clong(EAGAIN) or n == 0: done = true
+      else:
+        result = -1
+        done = true
+
+proc writeRest(fd: cint; data: string; start: int): bool {.passive.} =
+  ## `writeAll` from `start` on, through the ring: copies through a fixed
+  ## buffer, since a string is not addressable across a suspension.
   result = true
-  var wbuf = default(array[4096, char])
-  var off = 0
+  var wbuf {.noinit.}: array[4096, char]
+  var off = start
   var cont = true
   while off < data.len and cont:
     var clen = data.len - off
@@ -116,3 +133,12 @@ proc writeAll*(fd: cint; data: string): bool {.passive.} =
       else:
         wOff = wOff + w
     off = off + clen
+
+proc writeAll*(fd: cint; data: string): bool {.passive.} =
+  ## Write all of `data` to `fd`, handling short writes; false once the
+  ## peer is gone. What the socket buffer takes is written at once
+  ## (`writeNow`); only the rest waits on the ring.
+  let n = writeNow(fd, data, 0)
+  if n < 0: result = false
+  elif n == data.len: result = true
+  else: result = writeRest(fd, data, n)
