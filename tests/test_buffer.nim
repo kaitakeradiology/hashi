@@ -1,7 +1,7 @@
 ## Unit tests for `hashi/buffer`: bulk append, drop and copy across the
 ## string's inline and heap representations.
 
-import std/syncio
+import std/[syncio, strutils]
 import hashi/buffer
 import testkit
 
@@ -61,5 +61,36 @@ block:
   check buf[0] == '3' and buf[3] == '6' and buf[4] == char(0), "copies the requested window"
   copyOut(addr buf[0], "x", 0, 0)
   check buf[0] == '3', "zero bytes leaves the target alone"
+
+# ── findCrlf / findCrlfCrlf: exactly strutils.find, without its skip table ──
+var gSeed = 0x2545F491'u32
+proc nextRand(n: int): int =
+  ## xorshift32: a fixed, reproducible sequence.
+  gSeed = gSeed xor (gSeed shl 13)
+  gSeed = gSeed xor (gSeed shr 17)
+  gSeed = gSeed xor (gSeed shl 5)
+  int(gSeed mod uint32(n))
+
+proc crlfNoise(n: int): string =
+  const alphabet = "\r\n\ra\n"
+  result = ""
+  for i in 0 ..< n: result.add alphabet[nextRand(alphabet.len)]
+
+section "findCrlf and findCrlfCrlf agree with strutils.find"
+block:
+  var mismatches = 0
+  var cases = 0
+  for round in 0 ..< 4000:
+    let s = crlfNoise(nextRand(40))
+    let start = if s.len == 0: 0 else: nextRand(s.len + 1)
+    let last = if nextRand(3) == 0: -1 else: nextRand(s.len + 1) - 1  # never past s.high, like the parser
+    inc cases
+    if findCrlf(s, start, last) != find(s, "\r\n", start, last): inc mismatches
+    if findCrlfCrlf(s, start, last) != find(s, "\r\n\r\n", start, last): inc mismatches
+  check mismatches == 0, $mismatches & " mismatches in " & $cases & " random cases"
+  check findCrlf("", 0) == -1, "empty string"
+  check findCrlfCrlf("GET / HTTP/1.1\r\nHost: a\r\n\r\n", 0) == 23 and
+        find("GET / HTTP/1.1\r\nHost: a\r\n\r\n", "\r\n\r\n") == 23, "a request head"
+  check findCrlf("a\nb\r\n", 0) == 3, "a bare LF is not a line end"
 
 finish()

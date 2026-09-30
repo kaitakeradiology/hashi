@@ -17,6 +17,7 @@
 ## structure, not this.
 
 import std/[strutils, uri, times]
+import hashi/buffer
 import std/http/[httpdate, httpwire]
 
 type
@@ -154,12 +155,12 @@ proc parseRequestHead*(data: string; req: var Request): ParseStatus =
   ## invalid (bad method/target/version, malformed field line, etc.).
   result = psError
 
-  let headEnd = find(data, "\r\n\r\n")
+  let headEnd = findCrlfCrlf(data, 0)
   if headEnd < 0:
     return psIncomplete               # no CRLFCRLF yet — caller reads more
 
   # Request line: method SP request-target SP HTTP-version (§3).
-  let lineEnd = find(data, "\r\n", 0, headEnd + 1)
+  let lineEnd = findCrlf(data, 0, headEnd + 1)
   if lineEnd < 0:
     return psError
   # Exactly two single SPs split the three tokens; any other count (extra
@@ -185,7 +186,7 @@ proc parseRequestHead*(data: string; req: var Request): ParseStatus =
   var headers = default(seq[Header])
   var pos = lineEnd + 2
   while pos < headEnd:
-    let fEnd = find(data, "\r\n", pos, headEnd + 1)
+    let fEnd = findCrlf(data, pos, headEnd + 1)
     let lim = if fEnd < 0: headEnd else: fEnd
     var h = default(Header)
     if not parseField(substr(data, pos, lim - 1), h):
@@ -409,7 +410,7 @@ proc decodeChunked*(data: string; start: int; body: var string;
   body = ""
   var pos = start
   while true:
-    let lineEnd = find(data, "\r\n", pos)
+    let lineEnd = findCrlf(data, pos)
     if lineEnd < 0:
       return (psIncomplete, 0)
     # chunk-size = 1*HEXDIG, up to ';' (chunk-ext) or CRLF
@@ -431,7 +432,7 @@ proc decodeChunked*(data: string; start: int; body: var string;
       # last-chunk: consume trailer-section, then the terminating CRLF
       var tpos = lineEnd + 2
       while true:
-        let tEnd = find(data, "\r\n", tpos)
+        let tEnd = findCrlf(data, tpos)
         if tEnd < 0:
           return (psIncomplete, 0)
         if tEnd == tpos:                  # empty line ends the trailers
