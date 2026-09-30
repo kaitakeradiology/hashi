@@ -7,7 +7,7 @@
 ##
 ## `spawnTask` queues the task on the pool, so its ops run on worker lanes; main
 ## pumps its own lane while it waits, as `runLoop` would.
-import std/[syncio, monotimes]
+import std/[syncio, monotimes, atomics]
 from std/posix/posix import write, close
 import hashi/loop     # imported, not included
 import testkit
@@ -51,10 +51,42 @@ proc spawnReturnsAtOnce() =
   check spentMs < 100, "spawnTask returned in " & $spentMs & " ms (the task parks for 200)"
   check gNapDone, "the spawned task still ran to the end"
 
+var gBlocked: int     # accessed atomically: workers held by `blocker`
+var gRelease: bool    # accessed atomically
+var gProbeOnMain = -1 # accessed atomically: 1 if the probe ran on the main thread
+
+proc blocker() {.passive.} =
+  discard atomicFetchAdd(gBlocked, 1, moRelease)
+  while not atomicLoad(gRelease, moAcquire): discard
+
+proc probe() {.passive.} =
+  atomicStore(gProbeOnMain, (if isPoolWorker(): 0 else: 1), moRelease)
+
+proc mainTakesTurns() =
+  ## `runLoop` makes the main thread one of the pool's workers: each
+  ## `workTurn` runs queued tasks as well as driving the main thread's lane,
+  ## so a server uses every CPU rather than leaving one to a thread that
+  ## only waits. With every worker held, only the main thread can run `probe`.
+  var i = 0
+  while i < workerCount:
+    spawnTask blocker()
+    while atomicLoad(gBlocked, moAcquire) < i + 1: discard  # one per worker
+    i = i + 1
+  spawnTask probe()
+  var turns = 0
+  while atomicLoad(gProbeOnMain, moAcquire) < 0 and turns < 1000:
+    workTurn()
+    turns = turns + 1
+  atomicStore(gRelease, true, moRelease)
+  section "the main thread takes worker turns"
+  check atomicLoad(gProbeOnMain, moAcquire) == 1,
+    "with all " & $workerCount & " workers busy, the main thread ran the task"
+
 proc main() =
   discard cAlarm(10)
   initLoop()
   spawnReturnsAtOnce()
+  mainTakesTurns()
   var ok = 0
   var i = 0
   while i < 10:

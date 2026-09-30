@@ -2,8 +2,8 @@
 ##
 ## `std/ioring`'s worker pool is the scheduler; there is no hand-rolled
 ## event loop. `initLoop` brings up the pool and the ring, `spawnTask`
-## starts a passive proc on the pool, and `runLoop` pumps completions on the
-## calling thread until the pool is shut down. Both modules are re-exported,
+## starts a passive proc on the pool, and `runLoop` makes the calling thread
+## one more worker until the pool is shut down. Both modules are re-exported,
 ## so `submit`, `shutdownPool`, `submitTimeout` and friends come with this
 ## one import.
 ##
@@ -43,14 +43,24 @@ proc pumpIo*(timeoutMs = 0): bool {.discardable.} =
   ## thread must call this, or `runLoop`, for its own lane to progress.
   gReactor(timeoutMs)
 
+proc workTurn*(): bool {.discardable.} =
+  ## One worker's turn on the calling thread: run queued pool tasks, then
+  ## drive this thread's lane, waiting up to 1 ms for a completion when there
+  ## was no task to run. Returns whether tasks ran.
+  result = poolHelp()
+  let fired = pumpIo(if result: 0 else: 1)
+  if not fired and not result and not gReactorWaits:
+    when defined(posix):
+      discard usleepMicroseconds(1_000)
+    else:
+      sleep(1)
+
 proc runLoop*() =
-  ## Pump completions until `shutdownPool` is called. `serve` calls this.
+  ## Take worker turns on the calling thread until `shutdownPool` is called,
+  ## so the thread that runs the loop works alongside the pool rather than
+  ## only waiting. `serve` calls this.
   while not stopped():
-    if not pumpIo(100):
-      when defined(posix):
-        discard usleepMicroseconds(10_000)
-      else:
-        sleep(10)
+    workTurn()
 
 template spawnTask*(call: untyped) =
   ## Start the passive proc call `call` on the pool and return at once.
