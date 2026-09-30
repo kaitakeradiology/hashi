@@ -165,6 +165,7 @@ type
     acc: string                 ## inbound bytes not yet consumed
     rbuf: array[4096, byte]     ## the read buffer
     req: Request                ## the request being served
+    hb: HeadBuf                 ## each response's head, written in place
 
   HeadOutcome = enum
     hoOk        ## `c.req` holds a complete head
@@ -307,6 +308,29 @@ proc upgradeToWs(c: Conn; req: Request; ip: string; extraIdx: int) {.passive.} =
     echoHandler(ws)
   log(info, ip & " disconnected")
 
+proc unsent(c: Conn; headLen: int; body: string; sent: int): string =
+  ## The bytes of head-then-body that a partial gather write left behind.
+  result = newStringOfCap(headLen + body.len - sent)
+  var i = sent
+  while i < headLen:
+    result.add c.hb.data[i]
+    i = i + 1
+  result.add substr(body, max(0, sent - headLen))
+
+proc sendResponse(c: Conn; resp: Response; httpMethod: string; closing: bool): bool {.passive.} =
+  ## Write `resp` to the connection: the head from `c.hb` and the body in one
+  ## gather write when the socket takes them, the ring for anything left.
+  ## False when the peer is gone.
+  let headLen = serializeHead(c.hb, resp, httpMethod, closing = closing)
+  if headLen < 0:
+    result = writeAll(c.fd, serialize(resp, httpMethod, closing = closing))
+  else:
+    let body = if sendsBody(resp, httpMethod): resp.body else: ""
+    let sent = writevNow(c.fd, addr c.hb.data[0], headLen, body)
+    if sent < 0: result = false
+    elif sent == headLen + body.len: result = true
+    else: result = writeAll(c.fd, unsent(c, headLen, body, sent))
+
 proc respond(c: Conn; req: Request; ip: string): bool {.passive.} =
   ## Dispatch one ordinary request and write its response, timed for the
   ## access log. False when the peer is gone.
@@ -316,7 +340,7 @@ proc respond(c: Conn; req: Request; ip: string): bool {.passive.} =
     resp = dispatchAsync(req)
   else:
     resp = dispatchFull(appRouter, req)
-  result = writeAll(c.fd, serialize(resp, req.httpMethod, closing = shouldClose(req)))
+  result = sendResponse(c, resp, req.httpMethod, shouldClose(req))
   if result:
     accessLog(ip, resp.status, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
 

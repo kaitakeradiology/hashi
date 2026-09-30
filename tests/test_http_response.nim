@@ -218,4 +218,50 @@ block:
              "Content-Length: 2" & CRLF & CRLF & "ok",
     "CR/LF stripped from header name too"
 
+# ── serializeHead: the same bytes, written into a fixed buffer ─────────
+section "serializeHead matches serialize"
+
+proc headText(hb: HeadBuf): string =
+  result = ""
+  for i in 0 ..< hb.len: result.add hb.data[i]
+
+proc withHeaders(status: int; body: string; hs: seq[Header]): Response =
+  result = newResponse(status, body)
+  result.headers = hs
+
+block:
+  let t = fromUnix(1_790_000_000)
+  let cases = @[
+    newResponse(200, "hello"),
+    newResponse(404),
+    newResponse(204, "stray"),
+    newResponse(304),
+    newResponse(100),
+    withHeaders(200, "{}", @[Header(name: "Content-Type", value: "application/json")]),
+    withHeaders(200, "x", @[Header(name: "Date", value: "then"), Header(name: "Server", value: "other")]),
+    withHeaders(200, "abc", @[Header(name: "Content-Length", value: "3"), Header(name: "Connection", value: "keep-alive")]),
+    withHeaders(200, "ok", @[Header(name: "X-Echo", value: "a\r\nInjected: 1"), Header(name: "X-A\r\nEvil", value: "b")])]
+  var mismatches = 0
+  var n = 0
+  for r in cases:
+    for meth in ["GET", "HEAD"]:
+      for withDate in [true, false]:
+        for closing in [false, true]:
+          var hb = default(HeadBuf)
+          let len = serializeHead(hb, r, meth, t, withDate, closing)
+          let body = if sendsBody(r, meth): r.body else: ""
+          inc n
+          if len != hb.len or headText(hb) & body != serialize(r, meth, t, withDate, closing):
+            inc mismatches
+  check mismatches == 0, $mismatches & " mismatches in " & $n & " responses"
+
+block:
+  var big = newResponse(200, "ok")
+  var v = ""
+  for i in 0 ..< HeadCap: v.add 'v'
+  big.headers = @[Header(name: "X-Big", value: v)]
+  var hb = default(HeadBuf)
+  check serializeHead(hb, big, "GET") == -1, "a head larger than HeadCap does not fit"
+  check serialize(big, "GET", withDate = false).len > HeadCap, "serialize still writes it"
+
 finish()

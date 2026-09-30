@@ -24,7 +24,9 @@ import std/ioring
 export ioring
 
 when defined(posix):
-  from std/posix/posix import write, pcall, EAGAIN, EINTR
+  from std/posix/posix import write, pcall, EAGAIN, EINTR, IOVec
+  proc cWritev(fd: cint; iov: pointer; iovcnt: cint): int {.importc: "writev".}
+    ## `iov` points at `IOVec`s, which have `struct iovec`'s layout.
   proc usleepMicroseconds(usec: cuint): cint {.importc: "usleep", header: "<unistd.h>".}
 else:
   import std/windows/winlean
@@ -106,6 +108,35 @@ proc writeNow*(fd: cint; data: string; off: int): int =
     var done = false
     while not done and off + result < data.len:
       let n = pcall(write(fd, readRawData(data, off + result), data.len - off - result))
+      if n > 0: result = result + int(n)
+      elif n == -clong(EINTR): discard
+      elif n == -clong(EAGAIN) or n == 0: done = true
+      else:
+        result = -1
+        done = true
+
+proc writevNow*(fd: cint; head: pointer; headLen: int; body: string): int =
+  ## `writeNow` for the `headLen` bytes at `head` followed by `body`, sent
+  ## with one gather write so the body is not copied behind the head.
+  ## Returns the bytes of the two taken together, 0 when none, or -1 on an
+  ## error. Where there is no direct write (Windows) it returns 0.
+  result = 0
+  when defined(posix):
+    let total = headLen + body.len
+    var done = false
+    while not done and result < total:
+      var iov {.noinit.}: array[2, IOVec]
+      var cnt = 0
+      if result < headLen:
+        iov[0] = IOVec(iov_base: cast[pointer](cast[uint](head) + uint(result)),
+                       iov_len: csize_t(headLen - result))
+        cnt = 1
+      let bodyOff = max(0, result - headLen)
+      if bodyOff < body.len:
+        iov[cnt] = IOVec(iov_base: readRawData(body, bodyOff),
+                         iov_len: csize_t(body.len - bodyOff))
+        cnt = cnt + 1
+      let n = pcall(cWritev(fd, addr iov[0], cint(cnt)))
       if n > 0: result = result + int(n)
       elif n == -clong(EINTR): discard
       elif n == -clong(EAGAIN) or n == 0: done = true

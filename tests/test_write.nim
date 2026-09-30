@@ -77,6 +77,23 @@ proc main() =
     check writeNow(sv[0], small, 0) == -1, "a closed peer is an error"
     discard close(sv[0])
 
+  section "writevNow sends a head and a body in one write"
+  block:
+    let sv = pair()
+    var head = default(array[16, char])
+    let h = "HEAD-"
+    var i = 0
+    while i < h.len: head[i] = h[i]; i = i + 1
+    check writevNow(sv[0], addr head[0], h.len, "body") == 9, "both parts are taken whole"
+    check drain(sv[1], 9) == "HEAD-body", "head first, then body"
+    let big = pattern(8 * 1024 * 1024)
+    let n = writevNow(sv[0], addr head[0], h.len, big)
+    check n > h.len and n < h.len + big.len, "a body larger than the socket buffer is partial (" & $n & ")"
+    check writevNow(sv[0], addr head[0], h.len, big) == 0, "a full socket takes nothing"
+    discard close(sv[1])
+    check writevNow(sv[0], addr head[0], h.len, "body") == -1, "a closed peer is an error"
+    discard close(sv[0])
+
   section "writeAll delivers everything"
   block:
     let sv = pair()

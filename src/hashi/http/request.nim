@@ -305,19 +305,102 @@ var tDateLine {.threadvar.}: string
   ## HTTP-date has one-second resolution, so the line is formatted once a
   ## second per thread rather than per response.
 
-proc addDateLine(s: var string; now: Time) =
+const HeadCap* = 4096
+  ## The largest response head `serializeHead` writes in place.
+
+type
+  HeadBuf* = object
+    ## A response head written into fixed storage by `serializeHead`, so a
+    ## connection can reuse one buffer for every response instead of
+    ## building a string each time. `data[0 ..< len]` is the head.
+    data*: array[HeadCap, char]
+    len*: int
+    full: bool                 ## something did not fit
+
+proc add(b: var HeadBuf; s: string) =
+  if b.full: return
+  if b.len + s.len > HeadCap:
+    b.full = true
+    return
+  copyOut(addr b.data[b.len], s, 0, s.len)
+  b.len = b.len + s.len
+
+proc add(b: var HeadBuf; c: char) =
+  if b.full: return
+  if b.len >= HeadCap:
+    b.full = true
+    return
+  b.data[b.len] = c
+  b.len = b.len + 1
+
+template addDecimal(w: untyped; n: int) {.untyped.} =
+  ## Append the decimal digits of `n` >= 0, without an intermediate string.
+  var digits {.noinit.}: array[20, char]
+  var k = 0
+  var x = n
+  while true:
+    digits[k] = char(ord('0') + x mod 10)
+    k = k + 1
+    x = x div 10
+    if x == 0: break
+  while k > 0:
+    k = k - 1
+    w.add digits[k]
+
+template addDateLine(w: untyped; now: Time) {.untyped.} =
   ## Append `Date: <IMF-fixdate of now>` CRLF.
   let sec = now.toUnix
   if tDateLine.len == 0 or sec != tDateSec:
     tDateLine = "Date: " & formatHttpDate(now) & CRLF
     tDateSec = sec
-  s.add tDateLine
+  w.add tDateLine
 
-proc addFieldText(s: var string; t: string) =
-  ## Append `t` to `s` through `sanitizeFieldText`'s guard, copying it whole
-  ## when there is no CR or LF to strip.
-  if find(t, {'\r', '\n'}) < 0: s.add t
-  else: s.add sanitizeFieldText(t)
+template addFieldText(w: untyped; t: string) {.untyped.} =
+  ## Append `t` through `sanitizeFieldText`'s guard, copying it whole when
+  ## there is no CR or LF to strip.
+  if find(t, {'\r', '\n'}) < 0: w.add t
+  else: w.add sanitizeFieldText(t)
+
+proc sendsBody*(resp: Response; httpMethod: string): bool =
+  ## Whether `resp.body` follows the head on the wire: not for a 1xx, 204 or
+  ## 304 response, nor for a response to HEAD.
+  not isBodylessStatus(resp.status) and httpMethod != "HEAD"
+
+template writeHead(w: untyped; resp: Response; now: Time; withDate, closing: bool) {.untyped.} =
+  ## The status-line and field lines of `resp`, then the terminating CRLF.
+  ## See `serialize` for what is added and why.
+  let bodyless = isBodylessStatus(resp.status)
+  w.add "HTTP/1.1 "
+  w.addDecimal resp.status
+  w.add ' '
+  w.add resp.reason
+  w.add CRLF
+  var hasCL = false
+  var hasDate = false
+  var hasServer = false
+  var hasConn = false
+  for h in resp.headers:
+    if eqIgnoreCase(h.name, "Content-Length"): hasCL = true
+    if eqIgnoreCase(h.name, "Date"): hasDate = true
+    if eqIgnoreCase(h.name, "Server"): hasServer = true
+    if eqIgnoreCase(h.name, "Connection"): hasConn = true
+  if withDate and not hasDate:
+    w.addDateLine(now)
+  if not hasServer:
+    w.add "Server: hashi\r\n"
+  if closing and not hasConn:
+    w.add "Connection: close\r\n"
+  for h in resp.headers:
+    w.addFieldText h.name
+    w.add ": "
+    w.addFieldText h.value
+    w.add CRLF
+  if not hasCL and not bodyless:
+    # Content-Length is the body's length even for HEAD (the would-be GET body).
+    w.add "Content-Length: "
+    w.addDecimal resp.body.len
+    w.add CRLF
+  w.add CRLF
 
 proc serialize*(resp: Response; httpMethod = ""; now = getTime();
                 withDate = true; closing = false): string =
@@ -340,42 +423,20 @@ proc serialize*(resp: Response; httpMethod = ""; now = getTime();
   ##   - `closing` adds `Connection: close` (RFC 9112 §9.6) when the handler
   ##     set no Connection header: the server will close after this response.
   ##   - CR/LF are stripped from field names/values (response-splitting guard).
-  let bodyless = isBodylessStatus(resp.status)
-  let isHead = httpMethod == "HEAD"
   result = newStringOfCap(160 + resp.body.len)
-  result.add "HTTP/1.1 "
-  result.add $resp.status
-  result.add ' '
-  result.add resp.reason
-  result.add CRLF
-  var hasCL = false
-  var hasDate = false
-  var hasServer = false
-  var hasConn = false
-  for h in resp.headers:
-    if eqIgnoreCase(h.name, "Content-Length"): hasCL = true
-    if eqIgnoreCase(h.name, "Date"): hasDate = true
-    if eqIgnoreCase(h.name, "Server"): hasServer = true
-    if eqIgnoreCase(h.name, "Connection"): hasConn = true
-  if withDate and not hasDate:
-    result.addDateLine(now)
-  if not hasServer:
-    result.add "Server: hashi\r\n"
-  if closing and not hasConn:
-    result.add "Connection: close\r\n"
-  for h in resp.headers:
-    result.addFieldText h.name
-    result.add ": "
-    result.addFieldText h.value
-    result.add CRLF
-  if not hasCL and not bodyless:
-    # Content-Length is the body's length even for HEAD (the would-be GET body).
-    result.add "Content-Length: "
-    result.add $resp.body.len
-    result.add CRLF
-  result.add CRLF
-  if not bodyless and not isHead:
+  writeHead(result, resp, now, withDate, closing)
+  if sendsBody(resp, httpMethod):
     result.add resp.body
+
+proc serializeHead*(hb: var HeadBuf; resp: Response; httpMethod = "";
+                    now = getTime(); withDate = true; closing = false): int =
+  ## Write the head `serialize` would produce into `hb` and return its
+  ## length, or -1 when it does not fit in `HeadCap` bytes. The body, when
+  ## `sendsBody`, follows it on the wire unchanged.
+  hb.len = 0
+  hb.full = false
+  writeHead(hb, resp, now, withDate, closing)
+  result = if hb.full: -1 else: hb.len
 
 proc parseContentLength(s: string): int =
   ## ASCII digits only — no sign, no spaces, no comma-lists. Returns -1 on
