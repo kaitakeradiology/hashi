@@ -24,7 +24,7 @@ jobs:
           git checkout --detach "$SHA"
           echo "hashi $(git rev-parse --short HEAD) — $(git log -1 --format=%s)"
           export NIMONY=/opt/nimony/bin/nimony
-          ./tests/run
+          ./tests/run --fuzz
           for f in examples/*.nim bench/bench_server.nim tests/smoke_ws_outq.nim; do
             "$NIMONY" c "$f"
           done

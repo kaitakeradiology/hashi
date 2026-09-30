@@ -52,9 +52,9 @@ jobs:
         working-directory: nimony
         run: nim c -r src/hastur/hastur --release build all
 
-      - name: Unit tests
+      - name: Unit tests and fuzzers
         working-directory: hashi
-        run: NIMONY=../nimony/bin/nimony tests/run
+        run: NIMONY=../nimony/bin/nimony tests/run --fuzz
 
       - name: Examples, benches and smoke programs build
         working-directory: hashi
@@ -70,6 +70,18 @@ jobs:
       - name: WebSocket conformance over raw sockets
         working-directory: hashi
         run: python3 tests/conformance/ws_conformance.py "$(find nimcache -name hello -type f -perm -u+x | head -1)"
+
+      - name: WebSocket conformance, the Autobahn suite
+        # The echo server under the crossbario/autobahn-testsuite image, over
+        # the host network; check.py fails the step on any failed case.
+        working-directory: hashi
+        run: |
+          ../nimony/bin/nimony c -d:release --out:nimcache/ws_echo examples/ws_echo.nim
+          nimcache/ws_echo &
+          trap "kill $!" EXIT
+          sleep 1
+          docker pull -q crossbario/autobahn-testsuite
+          tests/conformance/autobahn/run.sh
 
       - name: API docs
         working-directory: hashi

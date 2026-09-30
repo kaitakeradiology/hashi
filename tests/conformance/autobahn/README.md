@@ -71,7 +71,10 @@ podman run -it --rm --network host \
 
 ## 5. Read the report
 
-Open `tests/conformance/autobahn/reports/index.html`. Each case shows Pass /
+`run.sh` finishes with `check.py`, which prints the tally and exits non-zero
+if any case failed; run it by hand after a run started another way
+(`python3 tests/conformance/autobahn/check.py`). For the detail, open
+`tests/conformance/autobahn/reports/index.html`. Each case shows Pass /
 Non-Strict / Fail / Unimplemented. Sections 12 and 13 (permessage-deflate)
 are expected to be Unimplemented: hashi has no compression extension. The
 current result is recorded in `doc/conformance.md`.

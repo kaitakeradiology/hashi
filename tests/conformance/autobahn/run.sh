@@ -14,10 +14,14 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$HERE/reports"
 RUNTIME="${RUNTIME:-docker}"   # set RUNTIME=podman to use podman
 
-"$RUNTIME" run -it --rm --network host \
+TTY=""
+[ -t 0 ] && [ -t 1 ] && TTY="-it"   # interactive only; CI has no terminal
+
+"$RUNTIME" run $TTY --rm --network host \
   -v "$HERE/fuzzingclient.json:/config/fuzzingclient.json:ro" \
   -v "$HERE/reports:/reports" \
   crossbario/autobahn-testsuite \
   wstest -m fuzzingclient -s /config/fuzzingclient.json
 
 echo "Report: $HERE/reports/index.html"
+python3 "$HERE/check.py" "$HERE/reports/index.json"
