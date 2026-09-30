@@ -291,6 +291,20 @@ proc sanitizeFieldText(s: string): string =
     if c != '\r' and c != '\n':
       result.add c
 
+var tDateSec {.threadvar.}: int64
+var tDateLine {.threadvar.}: string
+  ## This thread's last `Date` field line and the second it is for: an
+  ## HTTP-date has one-second resolution, so the line is formatted once a
+  ## second per thread rather than per response.
+
+proc addDateLine(s: var string; now: Time) =
+  ## Append `Date: <IMF-fixdate of now>` CRLF.
+  let sec = now.toUnix
+  if tDateLine.len == 0 or sec != tDateSec:
+    tDateLine = "Date: " & formatHttpDate(now) & CRLF
+    tDateSec = sec
+  s.add tDateLine
+
 proc serialize*(resp: Response; httpMethod = ""; now = getTime();
                 withDate = true; closing = false): string =
   ## Serialize `resp` to HTTP/1.1 wire bytes: status-line, field lines, the
@@ -325,7 +339,7 @@ proc serialize*(resp: Response; httpMethod = ""; now = getTime();
     if cmpIgnoreCase(h.name, "Server") == 0: hasServer = true
     if cmpIgnoreCase(h.name, "Connection") == 0: hasConn = true
   if withDate and not hasDate:
-    result.add "Date: " & formatHttpDate(now) & CRLF
+    result.addDateLine(now)
   if not hasServer:
     result.add "Server: hashi" & CRLF
   if closing and not hasConn:

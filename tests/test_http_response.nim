@@ -22,6 +22,22 @@ const SRV = "Server: hashi" & CRLF
   ## Default Server header (RFC 9110 §10.2.4): emitted after the status line
   ## (and after Date when present) whenever the handler set none.
 
+# ── Date follows the clock ─────────────────────────────────────────────
+section "Date"
+
+block:
+  # RFC 9110 §6.6.1: the Date line is the response's own clock, to the
+  # second — including when the same second repeats and when it goes back.
+  let t1 = fromUnix(1_790_000_000)
+  let t2 = fromUnix(1_790_000_001)
+  let line1 = "Date: " & formatHttpDate(t1) & CRLF
+  let line2 = "Date: " & formatHttpDate(t2) & CRLF
+  let a = serialize(newResponse(200, "x"), now = t1)
+  check line1 in a, "Date is formatHttpDate(now)"
+  check serialize(newResponse(200, "x"), now = t1) == a, "the same second gives the same bytes"
+  check line2 in serialize(newResponse(200, "x"), now = t2), "the next second moves Date on"
+  check line1 in serialize(newResponse(200, "x"), now = t1), "an earlier second moves it back"
+
 # ── Connection: close on the last response ────────────────────────────
 section "closing"
 
