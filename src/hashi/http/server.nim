@@ -172,50 +172,66 @@ type
     hoClosed    ## the peer went away
     hoTooBig    ## no head within `maxRequestHead` bytes
     hoBad       ## malformed
+    hoMore      ## incomplete, and nothing more has arrived yet
 
   BodyOutcome = enum
     boOk        ## `c.req.body` is filled; `need` is the request's total length
     boClosed
     boBad       ## ambiguous framing or a malformed chunked body
     boTooBig    ## Content-Length over `maxBodySize`
+    boMore      ## incomplete, and nothing more has arrived yet
 
-proc timedRead(c: Conn): int {.passive.} =
-  ## One read into `c.rbuf` with the idle deadline (`ServerConfig.idleTimeoutMs`)
-  ## armed for the duration of the wait. Any inbound byte resets the window,
-  ## so only a silent peer is reaped. Writes are deliberately untimed: under
-  ## TCP flow control a slow-but-alive reader is indistinguishable from a
-  ## stalled one, and dead-peer detection on the write side is
-  ## `TCP_USER_TIMEOUT`'s job (see `setKeepalive`).
-  ## Bytes that have already arrived are read at once; only an empty socket
-  ## parks on the ring.
+proc fillNow(c: Conn): int =
+  ## Append to `c.acc` what has already arrived: `readNow`'s answer.
   result = readNow(c.fd, addr c.rbuf[0], c.rbuf.len)
-  if result == ReadLater:
-    let w = gServerConfig.idleTimeoutMs
-    if w > 0: setDeadline(c.fd, getMonoTime().ticks + w.int64 * 1_000_000'i64)
-    result = waitRead(c.fd, addr c.rbuf[0], c.rbuf.len)
-    if w > 0: setDeadline(c.fd, 0'i64)
+  if result > 0: appendBytes(c.acc, addr c.rbuf[0], result)
+
+proc waitFill(c: Conn): int {.passive.} =
+  ## Wait on the ring for the next read into `c.acc`, with the idle deadline
+  ## (`ServerConfig.idleTimeoutMs`) armed for the duration of the wait. Any
+  ## inbound byte resets the window, so only a silent peer is reaped. Writes
+  ## are deliberately untimed: under TCP flow control a slow-but-alive reader
+  ## is indistinguishable from a stalled one, and dead-peer detection on the
+  ## write side is `TCP_USER_TIMEOUT`'s job (see `setKeepalive`).
+  let w = gServerConfig.idleTimeoutMs
+  if w > 0: setDeadline(c.fd, getMonoTime().ticks + w.int64 * 1_000_000'i64)
+  result = waitRead(c.fd, addr c.rbuf[0], c.rbuf.len)
+  if w > 0: setDeadline(c.fd, 0'i64)
   if result > 0: appendBytes(c.acc, addr c.rbuf[0], result)
 
 proc reject(c: Conn; status: int) {.passive.} =
   ## Answer `status` with an empty body; the caller ends the connection.
   discard writeAll(c.fd, serialize(newResponse(status)))
 
-proc awaitHead(c: Conn): HeadOutcome {.passive.} =
-  ## Read until a full request head is buffered into `c.req`, or the peer
-  ## closes, or the head exceeds `maxRequestHead` without terminating.
+proc headNow(c: Conn): HeadOutcome =
+  ## Parse a request head into `c.req` from what `c.acc` holds and what has
+  ## already arrived; `hoMore` when the head is incomplete and the socket is
+  ## empty.
   clear(c.req)
   var st = parseRequestHead(c.acc, c.req)
   while st == psIncomplete and c.acc.len <= gServerConfig.maxRequestHead:
-    if timedRead(c) <= 0: return hoClosed
+    let n = fillNow(c)
+    if n == ReadLater: return hoMore
+    if n <= 0: return hoClosed
     st = parseRequestHead(c.acc, c.req)
   case st
   of psOk: result = hoOk
   of psError: result = hoBad
   of psIncomplete: result = hoTooBig
 
-proc awaitBody(c: Conn; need: var int): BodyOutcome {.passive.} =
-  ## Read and decode the body `c.req`'s headers frame into `c.req.body`;
-  ## `need` becomes how many bytes of `c.acc` the whole request occupies.
+proc awaitHead(c: Conn): HeadOutcome {.passive.} =
+  ## `headNow`, waiting on the ring while the head is incomplete: a full head
+  ## in `c.req`, or the peer closed, or no head within `maxRequestHead`.
+  result = headNow(c)
+  while result == hoMore:
+    if waitFill(c) <= 0: return hoClosed
+    result = headNow(c)
+
+proc bodyNow(c: Conn; need: var int): BodyOutcome =
+  ## Decode the body `c.req`'s headers frame into `c.req.body` from what
+  ## `c.acc` holds and what has already arrived; `boMore` when it is
+  ## incomplete and the socket is empty. `need` becomes how many bytes of
+  ## `c.acc` the whole request occupies.
   let bi = bodyFraming(c.req)
   need = c.req.headBytes
   case bi.kind
@@ -227,7 +243,9 @@ proc awaitBody(c: Conn; need: var int): BodyOutcome {.passive.} =
     if bi.length > gServerConfig.maxBodySize: return boTooBig
     need = c.req.headBytes + bi.length
     while c.acc.len < need:
-      if timedRead(c) <= 0: return boClosed
+      let n = fillNow(c)
+      if n == ReadLater: return boMore
+      if n <= 0: return boClosed
     c.req.body = substr(c.acc, c.req.headBytes, need - 1)
     result = boOk
   of bkChunked:
@@ -244,8 +262,20 @@ proc awaitBody(c: Conn; need: var int): BodyOutcome {.passive.} =
       elif cr[0] == psError:
         result = boBad
         done = true
-      elif timedRead(c) <= 0:
-        done = true
+      else:
+        let n = fillNow(c)
+        if n == ReadLater:
+          result = boMore
+          done = true
+        elif n <= 0:
+          done = true
+
+proc awaitBody(c: Conn; need: var int): BodyOutcome {.passive.} =
+  ## `bodyNow`, waiting on the ring while the body is incomplete.
+  result = bodyNow(c, need)
+  while result == boMore:
+    if waitFill(c) <= 0: return boClosed
+    result = bodyNow(c, need)
 
 proc shouldClose(req: Request): bool =
   ## An explicit `Connection` header wins; otherwise HTTP/1.1 keeps alive and
@@ -321,19 +351,22 @@ proc unsent(c: Conn; headLen: int; body: string; sent: int): string =
     i = i + 1
   result.add substr(body, max(0, sent - headLen))
 
-proc sendResponse(c: Conn; resp: Response; httpMethod: string; closing: bool): bool {.passive.} =
-  ## Write `resp` to the connection: the head from `c.hb` and the body in one
-  ## gather write when the socket takes them, the ring for anything left.
-  ## False when the peer is gone.
+proc sendNow(c: Conn; resp: Response; httpMethod: string; closing: bool;
+             rest: var string): int =
+  ## Write `resp` to the connection as far as the socket takes it: the head
+  ## from `c.hb` and the body in one gather write. 1 when all of it went, -1
+  ## when the peer is gone, 0 with the unsent bytes in `rest` otherwise.
   let headLen = serializeHead(c.hb, resp, httpMethod, closing = closing)
   if headLen < 0:
-    result = writeAll(c.fd, serialize(resp, httpMethod, closing = closing))
+    rest = serialize(resp, httpMethod, closing = closing)
+    return 0
+  let body = if sendsBody(resp, httpMethod): resp.body else: ""
+  let sent = writevNow(c.fd, addr c.hb.data[0], headLen, body)
+  if sent < 0: result = -1
+  elif sent == headLen + body.len: result = 1
   else:
-    let body = if sendsBody(resp, httpMethod): resp.body else: ""
-    let sent = writevNow(c.fd, addr c.hb.data[0], headLen, body)
-    if sent < 0: result = false
-    elif sent == headLen + body.len: result = true
-    else: result = writeAll(c.fd, unsent(c, headLen, body, sent))
+    rest = unsent(c, headLen, body, sent)
+    result = 0
 
 proc respond(c: Conn; req: Request; ip: string): bool {.passive.} =
   ## Dispatch one ordinary request and write its response, timed for the
@@ -344,7 +377,9 @@ proc respond(c: Conn; req: Request; ip: string): bool {.passive.} =
     resp = dispatchAsync(req)
   else:
     resp = route(appRouter, c.req)
-  result = sendResponse(c, resp, req.httpMethod, shouldClose(req))
+  var rest = ""
+  let st = sendNow(c, resp, req.httpMethod, shouldClose(req), rest)
+  result = if st == 0: writeAll(c.fd, rest) else: st > 0
   if result:
     accessLog(ip, resp.status, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
 
@@ -378,8 +413,11 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
   var keepGoing = true
   while keepGoing:
     keepGoing = false
-    case awaitHead(c)
-    of hoClosed: discard
+    var ho = headNow(c)
+    let waited = ho == hoMore
+    if waited: ho = awaitHead(c)
+    case ho
+    of hoClosed, hoMore: discard     # awaitHead never answers hoMore
     of hoTooBig: reject(c, 431)
     of hoBad: reject(c, 400)
     of hoOk:
@@ -396,8 +434,10 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
         reject(c, 426)
       else:
         var need = 0
-        case awaitBody(c, need)
-        of boClosed: discard
+        var bo = bodyNow(c, need)
+        if bo == boMore: bo = awaitBody(c, need)
+        case bo
+        of boClosed, boMore: discard   # awaitBody never answers boMore
         of boBad: reject(c, 400)
         of boTooBig: reject(c, 413)
         of boOk:
@@ -409,6 +449,10 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
             # Consume this request's bytes; carry any pipelined leftover.
             dropPrefix(c.acc, need)
             keepGoing = not shouldClose(c.req)
+            # A request that found its bytes already waiting ran without
+            # suspending; yield once so a busy connection cannot hold the
+            # worker from the others queued on it.
+            if keepGoing and not waited: yieldTask()
   clearConn(fd)
   closeFd(fd)
 

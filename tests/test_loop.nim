@@ -102,12 +102,32 @@ proc readNowCases() =
   check readNow(sv[0], addr buf[0], buf.len) == 0, "a closed peer reads 0"
   discard close(sv[0])
 
+var gYields: int     # accessed atomically
+
+proc yielder() {.passive.} =
+  var i = 0
+  while i < 1000:
+    yieldTask()
+    i = i + 1
+  atomicStore(gYields, i, moRelease)
+
+proc yieldsResume() =
+  ## `yieldTask` requeues the caller, which then carries on where it left off.
+  spawnTask yielder()
+  var turns = 0
+  while atomicLoad(gYields, moAcquire) == 0 and turns < 5000:
+    workTurn()
+    turns = turns + 1
+  section "yieldTask"
+  check atomicLoad(gYields, moAcquire) == 1000, "a task that yields 1000 times runs to the end"
+
 proc main() =
   discard cAlarm(10)
   readNowCases()
   initLoop()
   spawnReturnsAtOnce()
   mainTakesTurns()
+  yieldsResume()
   var ok = 0
   var i = 0
   while i < 10:

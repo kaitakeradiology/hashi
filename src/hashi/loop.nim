@@ -77,6 +77,13 @@ proc sleepMs*(ms: int) {.passive.} =
   discard submitTimeout(afterMs(ms), c)
   suspend()
 
+proc yieldTask*() {.passive.} =
+  ## Let the other queued tasks run before the caller continues: its
+  ## continuation goes to the back of the pool's queue.
+  let c = delay()
+  submit(c)
+  suspend()
+
 proc waitAccept*(listenFd: cint): int {.passive.} =
   ## Suspend until a connection arrives; returns the new client fd (<0 err).
   result = -1
