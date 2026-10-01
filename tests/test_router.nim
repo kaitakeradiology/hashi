@@ -5,6 +5,8 @@ import std/opt   # before-middleware short-circuit signal (dispatchFull tests)
 import hashi/http/request
 import hashi/http/router
 import testkit
+import fuzzkit
+import std/strutils
 
 proc h1(req: Request): Response {.nimcall, raises.} = newResponse(200, "h1")
 proc h2(req: Request): Response {.nimcall, raises.} = newResponse(200, "h2")
@@ -252,5 +254,67 @@ block:
   check route(rr, req).body == "42", "the first request gets its param"
   req.target = "/nope"
   check route(rr, req).body == "params=0", "the next request's fallback sees none"
+
+# ── matchRoute agrees with the segment-splitting matcher it replaced ────
+section "matchRoute agrees with the reference matcher"
+
+proc refTryMatch(pattern, path: seq[string]): (bool, seq[PathParam]) =
+  var params: seq[PathParam] = @[]
+  var i = 0
+  var j = 0
+  while true:
+    if i >= pattern.len: return ((j >= path.len), params)
+    let p = pattern[i]
+    if p == "**": return (true, params)
+    if j >= path.len: return (false, params)
+    if p.len >= 1 and p[0] == ':':
+      params.add PathParam(key: substr(p, 1), val: path[j])
+    elif p == "*": discard
+    elif p != path[j]: return (false, params)
+    i = i + 1
+    j = j + 1
+
+proc refMatchRoute(r: Router; meth, target: string): MatchResult =
+  result = MatchResult(found: false, methodMismatch: false, idx: -1, params: @[])
+  let q = find(target, '?')
+  let path = if q < 0: target else: substr(target, 0, q - 1)
+  let pathSegs = splitSegments(path)
+  for i in 0 ..< r.routes.len:
+    let (ok, params) = refTryMatch(r.routes[i].segs, pathSegs)
+    if ok:
+      if r.routes[i].meth == meth:
+        return MatchResult(found: true, methodMismatch: false, idx: i, params: params)
+      result.methodMismatch = true
+
+proc samePairs(a, b: seq[PathParam]): bool =
+  if a.len != b.len: return false
+  for i in 0 ..< a.len:
+    if a[i].key != b[i].key or a[i].val != b[i].val: return false
+  result = true
+
+proc pick(xs: openArray[string]): string = xs[rnd(xs.len)]
+
+block:
+  seedFuzz(0x3C6EF372FE94F82B'i64)
+  const words = ["a", "b", "users", "x1", "", "?"]
+  var mismatches = 0
+  for it in 0 ..< 3000:
+    var rr = default(Router)
+    for k in 0 ..< 1 + rnd(4):
+      var pat = ""
+      for s in 0 ..< rnd(4):
+        pat.add "/" & pick([":id", ":p" & $rnd(3), "*", "**", "a", "b", "users"])
+      addRoute(rr, pick(["GET", "POST"]), (if pat.len == 0: "/" else: pat), h1)
+    var target = ""
+    for s in 0 ..< rnd(5):
+      target.add pick(["/", "//", "/a", "/b", "/users", "/x1", "/" & randomAlnum(3)])
+    if rnd(3) == 0: target.add "?" & pick(words) & "=" & randomAlnum(2)
+    let meth = pick(["GET", "POST", "HEAD"])
+    let a = matchRoute(rr, meth, target)
+    let b = refMatchRoute(rr, meth, target)
+    if a.found != b.found or a.methodMismatch != b.methodMismatch or a.idx != b.idx or
+       not samePairs(a.params, b.params):
+      inc mismatches
+  check mismatches == 0, $mismatches & " mismatches in 3000 random routers and targets"
 
 finish()

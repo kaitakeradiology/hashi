@@ -84,34 +84,50 @@ proc splitSegments*(path: string): seq[string] =
   for seg in split(path, '/'):
     if seg.len > 0: result.add seg
 
-proc stripQuery(target: string): string =
-  ## The path portion of a request-target: everything before the first `?`.
-  let q = find(target, '?')
-  result = if q < 0: target else: substr(target, 0, q - 1)
+proc nextSegment(t: string; pos, pe: int; s, e: var int): bool =
+  ## The next non-empty `/`-separated segment of `t[pos ..< pe]`, as
+  ## `t[s ..< e]`: the segments `splitSegments` would give, without copying.
+  var i = pos
+  while i < pe and t[i] == '/': inc i
+  if i >= pe: return false
+  s = i
+  while i < pe and t[i] != '/': inc i
+  e = i
+  result = true
 
-proc tryMatch(pattern, path: seq[string]): (bool, seq[PathParam]) =
-  ## Match a pattern's segments against a request path's segments, capturing
-  ## `:name` params. Returns (matched, params).
-  var params: seq[PathParam] = @[]
-  var i = 0   # index into pattern
-  var j = 0   # index into path
+proc segmentIs(t: string; s, e: int; p: string): bool =
+  ## Whether `t[s ..< e]` equals `p`.
+  if e - s != p.len: return false
+  for k in 0 ..< p.len:
+    if t[s + k] != p[k]: return false
+  result = true
+
+type Capture = tuple[seg, s, e: int]
+  ## A `:name` pattern segment (its index) and the target bytes it captured.
+
+proc tryMatch(pattern: seq[string]; t: string; pe: int; caps: var seq[Capture]): bool =
+  ## Match a pattern's segments against the path `t[0 ..< pe]`, recording a
+  ## capture per `:name` segment.
+  caps.setLen(0)
+  var i = 0       # index into pattern
+  var pos = 0     # scan position in the path
+  var s = 0
+  var e = 0
   while true:
+    let more = nextSegment(t, pos, pe, s, e)
     if i >= pattern.len:
-      # pattern exhausted: a match iff the path is also exhausted.
-      return ((j >= path.len), params)
+      return not more                    # a match iff the path is exhausted too
     let p = pattern[i]
     if p == "**":
-      return (true, params)              # catch-all: rest matches (incl. none)
-    if j >= path.len:
-      return (false, params)             # pattern wants more, path is out
+      return true                        # catch-all: rest matches (incl. none)
+    if not more:
+      return false                       # pattern wants more, path is out
     if p.len >= 1 and p[0] == ':':
-      params.add PathParam(key: substr(p, 1), val: path[j])
-    elif p == "*":
-      discard                            # single-segment wildcard, no capture
-    elif p != path[j]:
-      return (false, params)
+      caps.add (seg: i, s: s, e: e)
+    elif p != "*" and not segmentIs(t, s, e, p):
+      return false                       # `*` matches any one segment
     i = i + 1
-    j = j + 1
+    pos = e
 
 proc addRoute*(r: var Router; meth, path: string; h: Handler) =
   ## Register `h` for `meth path`. First registration wins on a match (see
@@ -131,13 +147,18 @@ proc matchRoute*(r: Router; meth, target: string): MatchResult =
   ## First route whose path pattern matches `target` and whose method is `meth`.
   ## If some route's path matches but no method does, `methodMismatch` is set.
   result = MatchResult(found: false, methodMismatch: false, idx: -1, params: @[])
-  let pathSegs = splitSegments(stripQuery(target))
+  let q = find(target, '?')
+  let pe = if q < 0: target.len else: q   # the path is everything before `?`
+  var caps: seq[Capture] = @[]
   for i in 0 ..< r.routes.len:
-    let (ok, params) = tryMatch(r.routes[i].segs, pathSegs)
-    if ok:
+    if tryMatch(r.routes[i].segs, target, pe, caps):
       if r.routes[i].meth == meth:
-        result = MatchResult(found: true, methodMismatch: false,
-                             idx: i, params: params)
+        result.found = true
+        result.methodMismatch = false
+        result.idx = i
+        for c in caps:
+          result.params.add PathParam(key: substr(r.routes[i].segs[c.seg], 1),
+                                      val: substr(target, c.s, c.e - 1))
         return
       else:
         result.methodMismatch = true
