@@ -8,6 +8,34 @@ notes.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-10-01
+
+### Added
+
+- `readNow`, `writevNow` and `yieldTask` (`hashi/loop`): a direct read of
+  what has arrived, a direct gather write, and a yield to the pool's other
+  tasks.
+- `HeadBuf` and `serializeHead` (`hashi/http/request`): a response head
+  written into fixed storage; `sendsBody`; `clear` for a reused `Request`.
+- `route` (`hashi/http/router`): `dispatchFull` on a request the caller owns.
+
+### Changed
+
+- A connection reads what has already arrived before waiting on the ring,
+  and its head, body and response steps finish without suspending when the
+  bytes are at hand; each such request then yields once so a busy
+  connection cannot hold its worker.
+- Each response is written from a per-connection head buffer and its body
+  in one `writev`; the router matches in place and attaches path params to
+  the request rather than copying it; header fields are parsed into the
+  request's own storage.
+- Release builds (`-d:release`, `-d:danger`; not Windows) use link-time
+  optimisation.
+- On 4 CPUs, plaintext keep-alive throughput is about 27% higher than 0.1.4
+  and median latency about a quarter lower; p99 is lower at 64 connections
+  and somewhat higher at 512.
+- CI runs the fuzzers, and on GitHub the Autobahn suite.
+
 ## [0.1.4] - 2026-10-01
 
 ### Added
@@ -95,7 +123,8 @@ compiler, with no dependencies beyond the Nimony standard library.
 - Conformance: the Autobahn WebSocket suite passes with no failures; a
   raw-socket WebSocket harness and seven parser fuzzers gate CI.
 
-[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/kaitakeradiology/hashi/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/kaitakeradiology/hashi/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/kaitakeradiology/hashi/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/kaitakeradiology/hashi/compare/v0.1.1...v0.1.2
