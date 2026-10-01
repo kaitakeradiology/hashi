@@ -23,6 +23,13 @@ export threadpool
 import std/ioring
 export ioring
 
+when (defined(release) or defined(danger)) and not defined(windows):
+  # A release build of a hashi program is optimised across modules: the
+  # request path crosses many small procs in several modules, and link-time
+  # optimisation inlines them. The flags reach every C unit and the link.
+  {.passC: "-flto".}
+  {.passL: "-flto".}
+
 when defined(posix):
   from std/posix/posix import read, write, pcall, EAGAIN, EINTR, IOVec
   proc cWritev(fd: cint; iov: pointer; iovcnt: cint): int {.importc: "writev".}
