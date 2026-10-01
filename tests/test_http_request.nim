@@ -220,4 +220,28 @@ block:
   check r.headers.len == 1 and nameAt(r, 0) == "Host" and r.target == "/b",
     "only the second request's headers remain"
 
+# ── request-line splitting: exactly two single spaces, known versions ──
+section "request-line edge cases"
+block:
+  const cases = [
+    ("GET / HTTP/1.1", psOk, "GET", "/", Http11),
+    ("GET / HTTP/1.0", psOk, "GET", "/", Http10),
+    ("GET  / HTTP/1.1", psError, "", "", HttpUnknown),
+    (" GET / HTTP/1.1", psError, "", "", HttpUnknown),
+    ("GET / HTTP/1.1 ", psError, "", "", HttpUnknown),
+    ("GET\t/ HTTP/1.1", psError, "", "", HttpUnknown),
+    ("GET / HTTP/1.10", psError, "", "", HttpUnknown),
+    ("GET / HTTP/1.", psError, "", "", HttpUnknown),
+    ("GET / http/1.1", psError, "", "", HttpUnknown),
+    ("GET  HTTP/1.1", psError, "", "", HttpUnknown),
+    ("G@T / HTTP/1.1", psError, "", "", HttpUnknown),
+    ("PROPFIND /a/b?c=d HTTP/1.1", psOk, "PROPFIND", "/a/b?c=d", Http11)]
+  var wrong = 0
+  for (line, want, meth, target, ver) in cases:
+    let (st, r) = parse(line & "\r\nHost: h\r\n\r\n")
+    if st != want or (st == psOk and (r.httpMethod != meth or r.target != target or r.version != ver)):
+      inc wrong
+      echo "  unexpected for '", line, "': ", st
+  check wrong == 0, "every request line parses as RFC 9112 §3 says"
+
 finish()
