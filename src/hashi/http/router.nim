@@ -13,7 +13,8 @@
 ##   - `*`       — matches one segment, not captured;
 ##   - `**`      — catch-all: matches all remaining segments, including none.
 ## The query string (`?…`) is ignored for matching. Method is a case-sensitive
-## token (RFC 9110 §3.1). Matching is on the raw, not percent-decoded, target.
+## token (RFC 9110 §3.1). Matching is on the raw, not percent-decoded, target,
+## which must be in `canonicalTarget` form (see `matchRoute`).
 
 import std/[opt, strutils]
 import std/errorcodes/errorcodes_http
@@ -146,6 +147,11 @@ proc patch*(r: var Router; path: string; h: Handler) = addRoute(r, "PATCH", path
 proc matchRoute*(r: Router; meth, target: string): MatchResult =
   ## First route whose path pattern matches `target` and whose method is `meth`.
   ## If some route's path matches but no method does, `methodMismatch` is set.
+  ##
+  ## Precondition: `target` has been through `canonicalTarget`, as
+  ## `parseRequestHead` guarantees. A `Request` built any other way (a test, a
+  ## future HTTP/3 `:path`) must call it first; otherwise the segments matched
+  ## here need not be the segments `path()` reports.
   result = MatchResult(found: false, methodMismatch: false, idx: -1, params: @[])
   let q = find(target, '?')
   let pe = if q < 0: target.len else: q   # the path is everything before `?`

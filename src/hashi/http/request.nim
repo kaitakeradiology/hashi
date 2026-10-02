@@ -51,7 +51,8 @@ type
   Request* = object
     ## A parsed HTTP request, as handed to a `Handler`.
     httpMethod*: string      ## e.g. "GET" (token, case-sensitive per spec).
-    target*: string          ## The request-target, in origin-form.
+    target*: string          ## The request-target, in the origin-form
+                             ## `canonicalTarget` produces.
     version*: HttpVersion
     headers*: seq[Header]
     headBytes*: int          ## Bytes consumed: request-line + fields + CRLFCRLF.
@@ -163,6 +164,112 @@ proc clear*(req: var Request) =
   keep.setLen(0)
   req.headers = move keep
 
+proc hexDigit(c: char): int =
+  ## The value of hex digit `c`, or -1.
+  if c >= '0' and c <= '9': result = ord(c) - ord('0')
+  elif c >= 'a' and c <= 'f': result = ord(c) - ord('a') + 10
+  elif c >= 'A' and c <= 'F': result = ord(c) - ord('A') + 10
+  else: result = -1
+
+proc isUnreserved(c: char): bool =
+  ## RFC 3986 §2.3 unreserved: ALPHA / DIGIT / "-" / "." / "_" / "~".
+  result = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+           (c >= '0' and c <= '9') or c == '-' or c == '.' or c == '_' or c == '~'
+
+proc canonicalTarget*(target: var string): bool =
+  ## Validate request-target `target` and rewrite it in place to its single
+  ## canonical form, or return false to reject it (the server answers 400).
+  ## The path `P` is the target up to the first `?`; the query `Q` is the rest,
+  ## from the `?` on.
+  ##
+  ## - The target must start with `/` (origin-form). The asterisk form and,
+  ##   deliberately, the absolute form of RFC 9112 §3.2.2 are rejected.
+  ## - `P` bytes are 0x21..0x7E except `#` and `\`; `Q` bytes are 0x21..0x7E
+  ##   or 0x80..0xFF except `#`.
+  ## - `P` of exactly `/` is kept. One trailing `/` after a non-empty segment
+  ##   is dropped (`/a/?x` → `/a?x`). Any other empty segment is rejected.
+  ## - Every `%` in `P` must be followed by two hex digits. An escaped
+  ##   unreserved byte (RFC 3986 §6.2.2.2) is decoded (`%41` → `A`); an
+  ##   escaped `/`, `\`, control byte (< 0x20) or 0x7F is rejected; any other
+  ##   escape is kept with its hex digits uppercased (`%2a` → `%2A`).
+  ## - After that decoding, a segment of exactly `.` or `..` is rejected, so
+  ##   `%2e` and `.%2E` count as dot segments.
+  ## - `Q` is only checked, never decoded or rewritten.
+  ##
+  ## For an accepted target, the router's `/`-separated segments of `P`
+  ## percent-decode one-to-one to the segments of `path()`: none is empty or a
+  ## dot segment, and none decodes to a `/`, NUL or `\`. Double encoding is
+  ## left alone (`%252e` stays, and decodes to `%2e`). The function is
+  ## idempotent. Its output is the precondition for `matchRoute` and `path()`:
+  ## `parseRequestHead` applies it, and a `Request` built any other way must
+  ## pass its target through it first.
+  let n = target.len
+  if n == 0 or target[0] != '/': return false
+  # Until `dirty`, the output is `target[0 ..< i]` and nothing is copied; the
+  # first rewrite copies that prefix into `o`, and the rest is built there.
+  var o = ""
+  var dirty = false
+  var segLen = 0        # output bytes in the current segment
+  var segDots = 0       # how many of them are '.'
+  var i = 1
+  while i < n and target[i] != '?':
+    let c = target[i]
+    if c == '/':
+      if segLen == 0: return false                       # empty segment
+      if segLen == segDots and segLen <= 2: return false  # dot segment
+      if dirty: o.add c
+      segLen = 0
+      segDots = 0
+      i = i + 1
+    elif c == '%':
+      if i + 2 >= n: return false
+      let h1 = target[i + 1]
+      let h2 = target[i + 2]
+      let hi = hexDigit(h1)
+      let lo = hexDigit(h2)
+      if hi < 0 or lo < 0: return false
+      let b = char(hi * 16 + lo)
+      if b == '/' or b == '\\' or b < ' ' or b == '\x7F': return false
+      let lower = (h1 >= 'a' and h1 <= 'f') or (h2 >= 'a' and h2 <= 'f')
+      if not dirty and (lower or isUnreserved(b)):
+        o = newStringOfCap(n)
+        appendBytes(o, readRawData(target, 0), i)
+        dirty = true
+      if isUnreserved(b):
+        o.add b
+        if b == '.': segDots = segDots + 1
+      elif dirty:
+        o.add '%'
+        o.add toUpperAscii(h1)
+        o.add toUpperAscii(h2)
+      segLen = segLen + 1
+      i = i + 3
+    elif c < '!' or c > '~' or c == '#' or c == '\\':
+      return false
+    else:
+      if dirty: o.add c
+      if c == '.': segDots = segDots + 1
+      segLen = segLen + 1
+      i = i + 1
+  let pe = i
+  if segLen == segDots and segLen > 0 and segLen <= 2: return false  # dot segment
+  if segLen == 0 and pe > 1:
+    # P ends in one '/' after a non-empty segment (a second one was refused
+    # above): drop it.
+    if dirty: o.setLen(o.len - 1)
+    else:
+      o = newStringOfCap(n)
+      appendBytes(o, readRawData(target, 0), pe - 1)
+      dirty = true
+  while i < n:
+    let c = target[i]
+    if c < '!' or c == '\x7F' or c == '#': return false
+    i = i + 1
+  if dirty:
+    if n > pe: appendBytes(o, readRawData(target, pe), n - pe)
+    target = move o
+  result = true
+
 proc parseRequestHead*(data: string; req: var Request): ParseStatus =
   ## Parse the request line and field block from the front of `data`.
   ##
@@ -172,6 +279,8 @@ proc parseRequestHead*(data: string; req: var Request): ParseStatus =
   ## has not arrived yet; `psError` if the bytes seen so far are already
   ## invalid (bad method/target/version, malformed field line, etc.). On
   ## `psError`, `req.headers` may hold the fields parsed before the error.
+  ## `req.target` is the target in `canonicalTarget` form; a target it
+  ## rejects is `psError`.
   result = psError
 
   let headEnd = findCrlfCrlf(data, 0)
@@ -196,10 +305,12 @@ proc parseRequestHead*(data: string; req: var Request): ParseStatus =
   if spCount != 2:
     return psError
   let meth = substr(data, 0, sp1 - 1)
-  let target = substr(data, sp1 + 1, sp2 - 1)
+  var target = substr(data, sp1 + 1, sp2 - 1)
   let version = versionOf(substr(data, sp2 + 1, lineEnd - 1))
-  if not isToken(meth) or target.len == 0 or version == HttpUnknown:
+  if not isToken(meth) or version == HttpUnknown:
     return psError                     # method must be a token (§3.1)
+  if not canonicalTarget(target):
+    return psError                     # see `canonicalTarget`
 
   # Field block: lines between the request line and the CRLFCRLF (§5),
   # parsed into `req.headers` in place so a reused request keeps its storage.
@@ -245,7 +356,9 @@ proc rawPath(target: string): string =
 proc path*(req: Request): string =
   ## The percent-decoded path (query string stripped). `/a%20b?x=1` → `/a b`.
   ## A malformed escape (`%` not followed by two hex digits) is not a URI
-  ## and decodes to ""; `+` stays literal, as it is in a path.
+  ## and decodes to ""; `+` stays literal, as it is in a path. For a parsed
+  ## request the target is in `canonicalTarget` form, so this agrees segment
+  ## for segment with the segments the router matched.
   result = ""
   discard decodeUrl(rawPath(req.target), result)
 

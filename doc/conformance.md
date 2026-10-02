@@ -34,7 +34,7 @@ The in-process fuzzers, run by CI:
 
    | Fuzzer | Target |
    |---|---|
-   | `fuzz_request` | `parseRequestHead`: random bytes, then well-formed heads parsed back exactly |
+   | `fuzz_request` | `parseRequestHead`: random bytes, then well-formed heads parsed back exactly with the target as a naive reference canonicaliser gives it; `canonicalTarget` on a dot/escape/slash-heavy alphabet against that reference, idempotence and the segment invariant `path()` and the router share |
    | `fuzz_chunked` | `decodeChunked`: random bytes, then chunk-encoded bodies decoded back exactly |
    | `fuzz_ws_frame` | `parseFrame` and `handleFrame`: random bytes, masked frames unmasked back exactly, the state machine and UTF-8 check on arbitrary input |
    | `fuzz_uri` | the `Request` accessors over `std/uri`, an `encodeQuery` round-trip, the origin check, and the upgrade detection under random damage |

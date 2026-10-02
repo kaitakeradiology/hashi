@@ -41,8 +41,8 @@ serve(8080'u16)
 ## What it does
 
 - HTTP/1.1 (RFC 9112): Content-Length and chunked bodies, keep-alive and
-  pipelining, request-smuggling checks, size limits, an idle reaper, TCP
-  keepalive.
+  pipelining, request-smuggling checks, request-target canonicalisation,
+  size limits, an idle reaper, TCP keepalive.
 - Routing with `:param` captures, `*` and `**` wildcards, 405 versus 404,
   a not-found fallback, before and after middleware, and per-request error
   handling on Nimony's `ErrorCode` model.

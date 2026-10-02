@@ -9,8 +9,9 @@
 ## the psOk cases fail until the parser is implemented — that's the point
 ## (TDD: red before green).
 
-import std/[syncio, strutils]
+import std/[syncio, strutils, uri]
 import hashi/http/request
+import hashi/http/router
 import testkit
 
 const CRLF = "\r\n"
@@ -243,5 +244,119 @@ block:
       inc wrong
       echo "  unexpected for '", line, "': ", st
   check wrong == 0, "every request line parses as RFC 9112 §3 says"
+
+# ── request-target canonicalisation: one form for router, path() and checks ──
+section "request-target canonicalisation"
+
+proc hA(req: Request): Response {.nimcall, raises.} = newResponse(200, "a")
+proc hUser(req: Request): Response {.nimcall, raises.} = newResponse(200, "user")
+proc hStatic(req: Request): Response {.nimcall, raises.} = newResponse(200, "static")
+proc hRoot(req: Request): Response {.nimcall, raises.} = newResponse(200, "root")
+
+var canonRouter = default(Router)
+canonRouter.get("/a", hA)              # 0
+canonRouter.get("/users/:id", hUser)  # 1
+canonRouter.get("/static/**", hStatic)  # 2
+canonRouter.get("/", hRoot)             # 3
+
+proc rawPathOf(t: string): string =
+  let q = find(t, '?')
+  result = if q < 0: t else: substr(t, 0, q - 1)
+
+proc segmentsAgree(target, decodedPath: string): bool =
+  ## The router's raw segments of `target`, each percent-decoded and joined
+  ## with `/`, rebuild `decodedPath`; no segment is empty, a dot segment, or
+  ## decodes to a `/`, NUL or `\`.
+  let raw = rawPathOf(target)
+  if find(raw, "//") >= 0: return false
+  if raw.len > 1 and raw[raw.len - 1] == '/': return false
+  var rebuilt = ""
+  for seg in splitSegments(raw):
+    var d = ""
+    if not decodeUrl(toOpenArray(seg, 0, seg.len - 1), d): return false
+    if d.len == 0 or d == "." or d == "..": return false
+    if find(d, {'/', '\0', '\\'}) >= 0: return false
+    rebuilt.add '/'
+    rebuilt.add d
+  if rebuilt.len == 0: rebuilt = "/"
+  result = rebuilt == decodedPath
+
+block:
+  # (target, canonical target, path(), route index or -1, captured :id)
+  const accepted = [
+    ("/", "/", "/", 3, ""),
+    ("/?x=1", "/?x=1", "/", 3, ""),
+    ("/a", "/a", "/a", 0, ""),
+    ("/a/", "/a", "/a", 0, ""),
+    ("/a/?x", "/a?x", "/a", 0, ""),
+    ("/users/X/", "/users/X", "/users/X", 1, "X"),
+    ("/users/%58", "/users/X", "/users/X", 1, "X"),
+    ("/static/", "/static", "/static", 2, ""),
+    ("/static/x/y/", "/static/x/y", "/static/x/y", 2, ""),
+    ("/%41", "/A", "/A", -1, ""),
+    ("/%7e%2D%5f%2e%30", "/~-_.0", "/~-_.0", -1, ""),
+    ("/a%2a", "/a%2A", "/a*", -1, ""),
+    ("/%252e%252e", "/%252e%252e", "/%2e%2e", -1, ""),
+    ("/a%20b", "/a%20b", "/a b", -1, ""),
+    ("/a%c3%a9", "/a%C3%A9", "/a\xC3\xA9", -1, ""),
+    ("/a?x=//y", "/a?x=//y", "/a", 0, ""),
+    ("/a?q=\xC4\x81", "/a?q=\xC4\x81", "/a", 0, ""),
+    ("/a?x=%zz/../", "/a?x=%zz/../", "/a", 0, ""),
+    ("/..a", "/..a", "/..a", -1, ""),
+    ("/a..", "/a..", "/a..", -1, ""),
+    ("/...", "/...", "/...", -1, "")]
+  var wrong = 0
+  for (target, canon, wantPath, route, id) in accepted:
+    let (st, r) = parse("GET " & target & " HTTP/1.1\r\nHost: h\r\n\r\n")
+    if st != psOk:
+      inc wrong
+      echo "  rejected '", target, "': ", st
+      continue
+    if r.target != canon or path(r) != wantPath:
+      inc wrong
+      echo "  '", target, "' gave target '", r.target, "' path '", path(r), "'"
+    var again = r.target
+    if not canonicalTarget(again) or again != r.target:
+      inc wrong
+      echo "  not idempotent on '", r.target, "': '", again, "'"
+    let m = matchRoute(canonRouter, "GET", r.target)
+    let gotRoute = if m.found: m.idx else: -1
+    if gotRoute != route:
+      inc wrong
+      echo "  '", target, "' routed to ", gotRoute, ", want ", route
+    elif route == 1 and (m.params.len != 1 or m.params[0].val != id):
+      inc wrong
+      echo "  '", target, "' captured the wrong :id"
+    if not segmentsAgree(r.target, path(r)):
+      inc wrong
+      echo "  router segments of '", r.target, "' disagree with path() '", path(r), "'"
+  check wrong == 0, "every accepted target canonicalises, routes and decodes as one form"
+
+block:
+  const rejected = [
+    "//a", "/a//b", "/a/b//", "//",
+    "/a/%2F/b", "/a/%2f/b", "/a%2fb",
+    "/a/./b", "/a/../b", "/a/.", "/a/..", "/a/../", "/a/./", "/.", "/..",
+    "/%2e", "/.%2E/", "/%2e%2e/", "/a/%2E%2e",
+    "/a%", "/a%2", "/a%2g", "/a%2?x", "/a%/2F",
+    "/a/%7F", "/a/%00", "/a%1f", "/a%5c", "/a%5C",
+    "/a\\b", "/a#b", "/a?b#c", "/a\x7Fb", "/a\tb", "/a\x01", "/a?b\x7F",
+    "*", "http://h/a", "users/X", "?x",
+    "/caf\xC3\xA9"]
+  var wrong = 0
+  for target in rejected:
+    let (st, r) = parse("GET " & target & " HTTP/1.1\r\nHost: h\r\n\r\n")
+    if st != psError:
+      inc wrong
+      echo "  accepted '", target, "' as '", r.target, "'"
+  check wrong == 0, "every non-canonicalisable target is rejected (400)"
+
+block:
+  var t = "/a/%2a/"
+  check canonicalTarget(t) and t == "/a/%2A", "canonicalTarget rewrites in place"
+  var bad = "/a/../b"
+  check not canonicalTarget(bad), "canonicalTarget refuses a dot segment"
+  var empty = ""
+  check not canonicalTarget(empty), "canonicalTarget refuses an empty target"
 
 finish()

@@ -75,6 +75,17 @@ the response with `newResponse(status, body)` and append to
 body for `HEAD` and bodyless statuses, and strips CR and LF from header
 values.
 
+**Request targets.** Only origin-form is accepted (`*` and absolute-form
+are refused, the latter a deliberate deviation from RFC 9112 §3.2.2), and
+the parser rewrites the target to one canonical form before anything sees
+it: a single trailing `/` dropped, escaped unreserved bytes decoded, other
+escapes uppercased. Empty and dot segments (`//`, `.`, `..`, `%2e`),
+malformed escapes, an escaped `/`, `\`, NUL or control byte, a raw `\`,
+`#`, space, control or non-ASCII byte in the path, and `#`, space or a
+control byte in the query are answered 400 before routing or middleware.
+Routing, `path` and checks on `req.target` therefore all see the same
+segments. See `canonicalTarget`.
+
 **Request** exposes `path` (percent-decoded), `query`, `queryParams`,
 `queryParam`, `header`, `headers`, `hasHeader`, `pathParam`, `body`
 (decoded, whether Content-Length or chunked), `remoteAddress` and
