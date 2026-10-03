@@ -46,11 +46,12 @@ thread. Several handlers run at once on different threads, so any state
 shared between handlers (a table, a counter, a cache) needs a lock. State
 local to one handler is safe: one continuation runs in one place at a time.
 
-`.passive` procs are sequential code that suspends at I/O. Two Nimony
-constraints to write around: a `for` loop cannot contain a suspension
-point, so use `while`; and a `.passive` proc cannot take `var`, `openArray`
-or `varargs` parameters, which is why `WsConn` is a `ref` and `wsSend` takes
-`seq[byte]`.
+`.passive` procs are sequential code that suspends at I/O. A suspension
+point can sit anywhere, a `for` loop included, and a `.passive` proc can
+take `var`, `openArray` and `varargs` parameters across one. What such a
+parameter cannot do is escape: a call handed to the scheduler with `delay`
+or `spawnTask` can outlive the caller's frame, so it must not take one.
+The compiler rejects that; pass an owned value (`sink`) instead.
 
 ## HTTP
 
