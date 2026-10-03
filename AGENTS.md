@@ -63,8 +63,10 @@ setup. Hashi has no dependencies beyond the Nimony standard library;
 
 ## Nimony constraints
 
-- A `for` loop cannot contain a suspension point. Use `while`.
-- A `.passive` proc cannot take `var`, `openArray` or `varargs` params.
+- A suspension point may sit inside a `for` loop, and a `.passive` proc may
+  take `var`, `openArray` or `varargs` params across one. They cannot
+  escape: a call handed to the scheduler (`delay`, `spawnTask`) must not
+  take them, and the compiler rejects it. Pass owned values (`sink`).
 - Defects (bounds, overflow, nil dereference) are not catchable and abort
   the process. Transport code that parses attacker-controlled bytes must be
   fuzzed, and must never index without a check.
