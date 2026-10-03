@@ -8,7 +8,8 @@
 ## framing is answered with 400; an over-long head with 431; an over-long
 ## body with 413. A WebSocket upgrade hands the connection to the handler
 ## registered with `setWsHandler`, and a matching SSE request to the one
-## registered with `setSseHandler`.
+## registered with `setSseHandler`; both pass the pre-dispatch middleware
+## first.
 ##
 ## Handlers resume on the reactor's worker pool, so several run at once on
 ## different threads. State local to a handler is safe; state shared between
@@ -80,7 +81,10 @@ proc setNotFoundHandler*(h: Handler) =
   setNotFound(appRouter, h)
 
 proc addBeforeMiddleware*(m: BeforeMiddleware) =
-  ## Append a pre-dispatch middleware. See `hashi/http/router`.
+  ## Append a pre-dispatch middleware. See `hashi/http/router`. The chain
+  ## runs for routes, SSE requests and WebSocket upgrades on the main
+  ## listener, where a claim refuses the upgrade; it does not run on
+  ## `addWsListener` listeners.
   addBefore(appRouter, m)
 
 proc addAfterMiddleware*(m: AfterMiddleware) =
@@ -88,7 +92,8 @@ proc addAfterMiddleware*(m: AfterMiddleware) =
   addAfter(appRouter, m)
 
 proc setBeforeMiddleware*(m: seq[BeforeMiddleware]) =
-  ## Replace the whole pre-dispatch chain.
+  ## Replace the whole pre-dispatch chain. Its coverage is as for
+  ## `addBeforeMiddleware`.
   setBefore(appRouter, m)
 
 proc setAfterMiddleware*(m: seq[AfterMiddleware]) =
@@ -146,10 +151,11 @@ var gExtra: seq[Listener] = @[]
 proc addWsListener*(port: uint16; handler: WsHandler; bindAddr = ""): bool =
   ## Register an additional WebSocket-only listener on `port`/`bindAddr`, served
   ## on the same reactor with its own `handler`. The main listener's routes,
-  ## WebSocket handler and SSE handler are not reachable on it (a non-WebSocket
-  ## request gets 426), so a separate port or interface is its own trust
-  ## domain. Call before `serve`. Returns false once `MaxExtraListeners` are
-  ## registered. `bindAddr` takes the same literals as `serve`.
+  ## WebSocket handler, SSE handler and pre-dispatch middleware are not
+  ## reachable on it (a non-WebSocket request gets 426), so a separate port
+  ## or interface is its own trust domain. Call before `serve`. Returns false
+  ## once `MaxExtraListeners` are registered. `bindAddr` takes the same
+  ## literals as `serve`.
   if gExtra.len >= MaxExtraListeners: return false
   gExtra.add Listener(port: port, bindAddr: bindAddr, handler: handler)
   result = true
@@ -315,9 +321,12 @@ proc dispatchAsync(req: Request): Response {.passive.} =
 
 proc upgradeToWs(c: Conn; req: Request; ip: string; extraIdx: int) {.passive.} =
   ## The WebSocket upgrade for a request `isWebSocketUpgrade` accepted:
-  ## refuse a cross-site origin with 403, else answer 101 and hand the
-  ## socket to the handler, the main one or secondary listener `extraIdx`'s.
-  ## Returns once the handler returns; the caller closes the fd.
+  ## refuse a cross-site origin with 403; on the main listener (`extraIdx`
+  ## -1) run the pre-dispatch middleware, whose claim is sent as an ordinary
+  ## response in place of the upgrade; else answer 101 and hand the socket
+  ## to the handler, the main one or secondary listener `extraIdx`'s, which
+  ## skips the middleware. Returns once the handler returns or the upgrade
+  ## is refused; the caller closes the fd.
   let t0 = getMonoTime()
   let wsOrigin = header(req, "Origin")
   if not (originAllowed(wsOrigin) or originMatchesHost(wsOrigin, header(req, "Host"))):
@@ -325,6 +334,13 @@ proc upgradeToWs(c: Conn; req: Request; ip: string; extraIdx: int) {.passive.} =
     reject(c, 403)
     accessLog(ip, 403, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
     return
+  if extraIdx < 0:
+    let sc = runBefore(appRouter, req)
+    if sc.isSome:
+      let resp = runAfter(appRouter, req, sc.get(default(Response)))
+      discard writeAll(c.fd, serialize(resp, req.httpMethod))
+      accessLog(ip, resp.status, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
+      return
   if not writeAll(c.fd, handshakeResponse(req)): return
   accessLog(ip, 101, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
   log(info, ip & " connected")
@@ -422,12 +438,14 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
     of hoBad: reject(c, 400)
     of hoOk:
       let ip = if viaProxy: clientIp(c.req, c.peer) else: peerIp
+      c.req.remoteAddress = ip
       if isWebSocketUpgrade(c.req):
         if extraIdx >= 0:
           # Socket peer and attributed client differ behind a proxy; if they
           # match when a proxy was expected, it is missing from
           # `setTrustedProxies`.
           log(debug, "ws-only accept peer=" & c.peer & " effective=" & ip)
+        c.req.startNanos = getMonoTime().ticks
         upgradeToWs(c, c.req, ip, extraIdx)
       elif extraIdx >= 0:
         log(info, ip & " ws-only: non-WebSocket " & c.req.httpMethod & " " & c.req.target & " → 426")
@@ -441,7 +459,6 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
         of boBad: reject(c, 400)
         of boTooBig: reject(c, 413)
         of boOk:
-          c.req.remoteAddress = ip
           c.req.startNanos = getMonoTime().ticks
           if hasSseHandler() and sseMatches(c.req):
             serveSse(c, c.req, ip)

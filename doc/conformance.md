@@ -20,6 +20,19 @@ Autobahn marks the late close non-strict. Sections 12 and 13 exercise the
 compression extension, which hashi does not negotiate, so the suite skips
 them.
 
+## WebSocket: raw-socket checks
+
+Two Python 3 scripts, run by CI, drive a built server over raw sockets:
+
+- `tests/conformance/ws_conformance.py <bin>` runs the Autobahn case
+  categories against `examples/hello` (the default echo handler).
+- `tests/conformance/ws_before.py <bin>` runs `tests/smoke_ws_before` on
+  two free ports and checks that the before-middleware gates upgrades on
+  the main listener (a claim is answered as an ordinary response and the
+  handler never runs), that an `addWsListener` listener skips it, and that
+  a non-canonical target is answered 400 on both plain requests and
+  upgrades.
+
 # HTTP/1.1 conformance + fuzzing
 
 The in-process fuzzers, run by CI:

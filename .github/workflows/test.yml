@@ -59,7 +59,7 @@ jobs:
       - name: Examples, benches and smoke programs build
         working-directory: hashi
         run: |
-          for f in examples/*.nim bench/bench_server.nim tests/smoke_ws_outq.nim; do
+          for f in examples/*.nim bench/bench_server.nim tests/smoke_ws_outq.nim tests/smoke_ws_before.nim; do
             ../nimony/bin/nimony c "$f"
           done
 
@@ -70,6 +70,12 @@ jobs:
       - name: WebSocket conformance over raw sockets
         working-directory: hashi
         run: python3 tests/conformance/ws_conformance.py "$(find nimcache -name hello -type f -perm -u+x | head -1)"
+
+      - name: Before-middleware on WebSocket upgrades over raw sockets
+        working-directory: hashi
+        run: |
+          ../nimony/bin/nimony c --out:nimcache/smoke_ws_before tests/smoke_ws_before.nim
+          python3 tests/conformance/ws_before.py nimcache/smoke_ws_before
 
       - name: WebSocket conformance, the Autobahn suite
         # The echo server under the crossbario/autobahn-testsuite image, over

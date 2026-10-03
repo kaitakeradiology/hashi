@@ -93,8 +93,10 @@ segments. See `canonicalTarget`.
 
 **Middleware.** `addBeforeMiddleware` runs before route matching; returning
 `some(resp)` short-circuits, and that response still passes through the
-after-chain. `addAfterMiddleware` sees every response, including errors,
-and is the place for security headers. Middleware must not raise.
+after-chain. The before-chain runs for routes, SSE requests and WebSocket
+upgrades on the main listener, not on `addWsListener` listeners.
+`addAfterMiddleware` sees every response, including errors, and is the
+place for security headers. Middleware must not raise.
 
 **Passive handlers.** `addAsyncHandler` appends a
 `proc(req: Request): Opt[Response] {.passive.}` that may suspend on
@@ -130,6 +132,10 @@ request's cookie header and target, since the handler never sees the
 `Request`. With no handler registered the server runs an echo loop, which
 is what the Autobahn run exercises.
 
+The before-middleware runs on the upgrade request after the origin check
+and before the 101: a `some(resp)` is sent through the after-chain as an
+ordinary response, the connection closes, and the handler never runs.
+
 `wsPeek` looks at the next complete message without blocking and stashes
 it; `wsSkip` discards the stash. `setAllowedOrigins` refuses upgrades from
 a browser `Origin` that is neither same-origin nor listed.
@@ -147,9 +153,10 @@ something. Every lane is bounded: STREAM and CONTROL by a byte budget each
 PONG. `examples/ws_queued.nim` is the worked example.
 
 **Secondary listeners.** `addWsListener(port, handler)` serves an extra
-WebSocket-only listener on the same reactor. Routes, SSE and the main
-WebSocket handler are not reachable there, so a separate port or interface
-is its own trust domain.
+WebSocket-only listener on the same reactor. Routes, SSE, the main
+WebSocket handler and the before-middleware are not reachable there, so a
+separate port or interface is its own trust domain, and its handler does
+any authentication itself.
 
 ## Server-Sent Events
 
