@@ -7,9 +7,12 @@
 ## runs, and any inbound byte resets it. A recurring reaper sweep calls
 ## `reapExpired`, which `shutdown()`s any fd still armed past its deadline;
 ## that routes through the normal completion path, so the parked read returns
-## <=0 and the driver's existing unwind closes the fd. The one exception is
-## the WebSocket keepalive's idle close: it arms a deadline as a backstop
-## for its own CLOSE and leaves it armed for teardown's `clearConn`.
+## <=0 and the driver's existing unwind closes the fd. Two exceptions arm a
+## deadline around a write rather than a read, both in the WebSocket
+## keepalive: the idle close arms one as a backstop for its own CLOSE and
+## leaves it armed for teardown's `clearConn`, and with `userTimeoutMs` at 0
+## the reader arms one while its own PING, PONG or CLOSE waits behind
+## another writer, disarming it when the write returns.
 ##
 ## The byte count is the aggregate bound the per-connection caps cannot give:
 ## every read adds (`addInflight`), every consumed or dropped byte subtracts
@@ -21,7 +24,8 @@
 ## until the peer's window reopens, which for a slow-but-alive reader can be
 ## much slower than its read cadence, so an app-layer write deadline cannot
 ## tell "slow but alive" from "stalled". Write-stall / dead-peer detection is
-## the kernel's job (`TCP_USER_TIMEOUT`); see `hashi/http/server`.
+## the kernel's job (`TCP_USER_TIMEOUT`); see `hashi/http/server`. The
+## WebSocket exceptions above apply only once the idle timeout has passed.
 ##
 ## Lock-free: the connection worker writes its slot's deadline and the reaper
 ## reads it, both via aligned 64-bit atomics. fd reuse needs no generation
@@ -66,6 +70,12 @@ proc setDeadline*(fd: cint; deadlineNanos: int64) =
   ## Arm (deadlineNanos > 0) or disarm (0) the reap deadline for `fd`.
   if fd >= 0.cint and fd.int < MaxFds:
     atomicStore(gDeadline[fd.int], deadlineNanos)
+
+proc deadlineOf*(fd: cint): int64 =
+  ## The reap deadline armed for `fd`, or 0 when none is.
+  result = 0'i64
+  if fd >= 0.cint and fd.int < MaxFds:
+    result = atomicLoad(gDeadline[fd.int])
 
 proc clearConn*(fd: cint) =
   ## Disarm on connection teardown (belt-and-suspenders; the driver also disarms

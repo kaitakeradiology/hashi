@@ -297,17 +297,50 @@ proc keepaliveStep(ws: WsConn; now: int64): KeepaliveStep =
   else:
     result = ksNone
 
+proc armWriteBackstop(ws: WsConn): bool =
+  ## Before a control write of the reader's own that may wait on the write
+  ## guard (direct mode), arm the reap deadline for when the idle close's
+  ## backstop would fire: the idle timeout after the last inbound byte, plus
+  ## `WsCloseGraceMs`, and never less than the grace from now. A writer
+  ## stalled on a peer that stopped reading then cannot pin the reader past
+  ## that. Only with `userTimeoutMs` at 0: otherwise `TCP_USER_TIMEOUT`
+  ## already ends a stalled write, and unlike this deadline it does not
+  ## cut off a slow peer that is still acknowledging. Arms nothing when the
+  ## idle timeout is off, in queued mode (the write only enqueues), or when
+  ## a deadline is already armed. True when it armed one, which the caller
+  ## disarms once the write returns.
+  result = false
+  let idle = gServerConfig.wsIdleTimeoutMs
+  if idle > 0 and gServerConfig.userTimeoutMs <= 0 and not ws.hasOutq and
+     deadlineOf(ws.fd) == 0'i64:
+    let graceNs = int64(WsCloseGraceMs) * 1_000_000'i64
+    let idleNs = min(int64(idle), 1_000_000_000'i64) * 1_000_000'i64
+    let now = getMonoTime().ticks
+    setDeadline(ws.fd, max(ws.lastInbound + idleNs + graceNs, now + graceNs))
+    result = true
+
+proc readerEmit(ws: WsConn; frame: string; lane: WsLane;
+                coalesce = false): bool {.passive.} =
+  ## `wsEmitCtl` for a control frame the reader sends (PING, PONG, CLOSE),
+  ## covered by `armWriteBackstop` while it waits and writes.
+  let armed = armWriteBackstop(ws)
+  result = wsEmitCtl(ws, frame, lane, coalesce)
+  if armed: setDeadline(ws.fd, 0'i64)
+
 proc keepalivePing(ws: WsConn): bool {.passive.} =
   ## Send a keepalive PING unless the connection is closing or the peer is
   ## part-way through a frame (`ws.acc` holds a partial one); false only when
   ## the write or the enqueue failed. In direct mode it waits its turn on the
-  ## write guard; in queued mode it goes on the CONTROL lane and does not
-  ## coalesce, so it never evicts a PONG the peer is owed. The clock
-  ## restarts either way, so a skipped PING is not retried at once.
+  ## write guard; a PING stuck behind a writer stalled on a peer that stopped
+  ## reading is cut off by `TCP_USER_TIMEOUT`, or, with `userTimeoutMs` at
+  ## 0, by the reap backstop at idle + grace. In queued mode it goes on the
+  ## CONTROL lane and does not coalesce, so it never evicts a PONG the peer
+  ## is owed. The clock restarts either way, so a skipped PING is not
+  ## retried at once.
   result = true
   ws.lastPingSent = getMonoTime().ticks
   if ws.open and ws.acc.len == 0:
-    result = wsEmitCtl(ws, serializeFrame(opPing, ""), lnControl)
+    result = readerEmit(ws, serializeFrame(opPing, ""), lnControl)
 
 proc idleClose(ws: WsConn): int {.passive.} =
   ## The idle timeout: arm the reap backstop (left armed; teardown's
@@ -396,7 +429,7 @@ proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
         appendBytes(ws.acc, addr ws.rbuf[0], n)
         ws.lastInbound = getMonoTime().ticks
     elif pr[0] == psError:
-      discard wsEmitCtl(ws, serializeFrame(opClose, closeFrameBody(1002)), lnControl)
+      discard readerEmit(ws, serializeFrame(opClose, closeFrameBody(1002)), lnControl)
       ws.open = false
       result = WsMessage(kind: wmClose, data: "")
       done = true
@@ -407,7 +440,7 @@ proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
       wsConsume(ws, pr[1])
       let act = handleFrame(ws.st, f, gServerConfig.maxWsMessage)
       if act.kind == waPong:
-        if not wsEmitCtl(ws, serializeFrame(opPong, act.payload), lnUrgent, true):
+        if not readerEmit(ws, serializeFrame(opPong, act.payload), lnUrgent, true):
           ws.open = false
           result = WsMessage(kind: wmClose, data: "")
           done = true
@@ -416,7 +449,7 @@ proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
         result = WsMessage(kind: k, data: act.payload)
         done = true
       elif act.kind == waClose:
-        discard wsEmitCtl(ws,
+        discard readerEmit(ws,
           serializeFrame(opClose, closeFrameBody(act.closeCode) & act.payload), lnControl)
         ws.open = false
         result = WsMessage(kind: wmClose, data: act.payload)

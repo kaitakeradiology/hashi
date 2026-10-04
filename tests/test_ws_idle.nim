@@ -172,6 +172,10 @@ proc payloadFor(big, steady: bool): string =
   else:
     result = newString(1024)
 
+var gStubborn = false    # the writers ignore ws.open and stop only on a refused write
+var gSendFalseMs = 0'i64 # when the streaming task's wsSend first returned false
+var gRawFalseMs = 0'i64  # likewise the raw writer's wsWriteAll
+
 proc streamTask(ws: WsConn; big, steady: bool) {.passive.} =
   ## A second task writing to the connection while its handler is parked in
   ## `wsRecv`.
@@ -180,11 +184,13 @@ proc streamTask(ws: WsConn; big, steady: bool) {.passive.} =
   while going:
     let ok = wsSend(ws, payload, true)
     if ok: gStreamed = gStreamed + 1
-    else: going = false
+    else:
+      gSendFalseMs = nowMs()
+      going = false
     if not steady:
       let nap = if big: 10 else: 5
       sleepMs(nap)
-    if not ws.open: going = false
+    if not gStubborn and not ws.open: going = false
   gStreamDone = true
 
 proc drainQueue(ws: WsConn; q: OutQueue) {.passive.} =
@@ -202,8 +208,10 @@ proc rawStreamTask(ws: WsConn) {.passive.} =
   var going = true
   while going:
     let ok = wsWriteAll(ws, frame)
-    if not ok: going = false
-    if not ws.open: going = false
+    if not ok:
+      gRawFalseMs = nowMs()
+      going = false
+    if not gStubborn and not ws.open: going = false
   gRawDone = true
 
 proc serveOne(fd: cint; queued, stream, big, steady, dual, closeOnText: bool) {.passive.} =
@@ -249,7 +257,8 @@ proc serveOne(fd: cint; queued, stream, big, steady, dual, closeOnText: bool) {.
 # ── one scenario ────────────────────────────────────────────────────────
 
 proc start(p: var Peer; ping, idle: int; queued = false; stream = false;
-           big = false; steady = false; dual = false; closeOnText = false): int64 =
+           big = false; steady = false; dual = false; closeOnText = false;
+           stubborn = false): int64 =
   ## Configure, open a socketpair and start the server half on it. Returns
   ## the start time in ms.
   var cfg = defaultServerConfig()
@@ -268,6 +277,9 @@ proc start(p: var Peer; ping, idle: int; queued = false; stream = false;
   gDone = false; gKind = -1; gOpen = true; gMsgs = 0; gEndMs = 0; gLastMsg = ""
   gStreamed = 0; gUrgent = -1; gControl = -1
   result = nowMs()
+  gStubborn = stubborn
+  gSendFalseMs = 0
+  gRawFalseMs = 0
   spawnTask serveOne(sv[0], queued, stream, big, steady, dual, closeOnText)
 
 proc drive(p: var Peer; mode: PeerMode; forMs: int; untilDone: bool) =
@@ -502,18 +514,25 @@ block:
   check p.bad == 0, "every frame parsed"
   check p.dataAfterClose == 0, "no data frame followed the CLOSE"
 
-section "(l) two writers: nothing follows the idle CLOSE on the wire"
+section "(l) two writers that ignore ws.open: nothing follows the idle CLOSE"
 block:
+  # Both writers keep sending until a write is refused, so each is certain
+  # to try a data frame after the CLOSE has gone out.
   var p = default(Peer)
-  let t0 = start(p, 100, 400, stream = true, steady = true, dual = true)
+  let t0 = start(p, 100, 400, stream = true, steady = true, dual = true,
+                 stubborn = true)
   drive(p, pmSilent, 8000, true)
   drive(p, pmSilent, 200, false)
   discard close(p.fd)
   let closeAt = p.closeAtMs - t0
+  let sendAt = gSendFalseMs - t0
+  let rawAt = gRawFalseMs - t0
   check gDone, "the handler and both writers finished"
   check p.closes == 1 and p.closeCode == 1001, "a CLOSE 1001 arrived (code " & $p.closeCode & ")"
   check p.closeAtMs > 0 and closeAt < 1500, "at about the idle timeout (" & $closeAt & " ms)"
   check p.dataAfterClose == 0, "no data frame followed the CLOSE (" & $p.dataAfterClose & ")"
+  check gSendFalseMs > 0 and sendAt < 1500, "wsSend returned false at the CLOSE, not at the backstop (" & $sendAt & " ms)"
+  check gRawFalseMs > 0 and rawAt < 1500, "so did wsWriteAll (" & $rawAt & " ms)"
   check p.bad == 0, "every frame parsed"
 
 section "teardown"

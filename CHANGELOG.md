@@ -17,7 +17,10 @@ notes.
   every `wsPingIntervalMs` (default 20 s) of inbound silence and, after
   `wsIdleTimeoutMs` (default 60 s), CLOSE 1001 and returns `wmClose`.
   Only inbound bytes reset the clock. `wsIdleClosedTotal`
-  (`hashi/http/connreg`) counts these closes.
+  (`hashi/http/connreg`) counts these closes. With `userTimeoutMs` at 0, a
+  PING, PONG or CLOSE the reader blocks on behind a stalled writer (direct
+  mode) is cut off by the reap backstop 5 s past the idle timeout.
+- `deadlineOf` (`hashi/http/connreg`): the reap deadline armed for an fd.
 - `waitReadableUntil` (`hashi/loop`): wait for an fd to become readable,
   with a deadline.
 - `validateServerConfig` (`hashi/http/config`); `serve` logs the reason and
