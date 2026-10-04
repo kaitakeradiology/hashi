@@ -5,14 +5,29 @@
 ## (`proc(ws: WsConn) {.passive.}`). Protocol correctness (framing,
 ## fragmentation, UTF-8, close codes) lives in `hashi/ws/protocol`; this
 ## module is the I/O loop that drives it and surfaces complete messages to
-## the handler.
+## the handler, and runs the keepalive while `wsRecv` waits.
+##
+## Every write to the socket goes through one of two leaf writers,
+## `wsWriteAll` and the send-buffer writer behind `wsSend`, and each holds
+## the connection's write guard (`WsConn.writeGuard`) for a whole frame, so
+## a control frame from the reader (PONG, PING, CLOSE) never lands inside a
+## data frame another task is part-way through writing. A writer that finds
+## the guard held parks, 1 ms at first and doubling to 50 ms, rather than
+## spinning. The guard is fair to parked writers: a writer arriving while
+## others wait parks behind them, so control frames wait their turn behind
+## at most the frame being written, even against a task sending frames
+## back to back. No caller of the leaf writers takes the guard, so it never
+## nests. Once a CLOSE has been written, no data frame is. The guard covers
+## the write, not `ws.sbuf`: two tasks calling `wsSend` at once still need
+## queued mode (`useOutQueue`).
 
-import std/monotimes
+import std/[monotimes, atomics]
+from std/posix/posix import pcall, EAGAIN, EINTR
 import hashi/loop
 import hashi/buffer
 import hashi/http/request
 import hashi/http/config
-import hashi/http/connreg   # setDeadline, addInflight/subInflight
+import hashi/http/connreg   # setDeadline, addInflight/subInflight, countWsIdleClose
 import hashi/ws/frame
 import hashi/ws/protocol
 import hashi/ws/session
@@ -20,14 +35,64 @@ import hashi/ws/outq
 
 proc cRecv(fd: cint; buf: pointer; len: csize_t; flags: cint): int {.importc: "recv", header: "<sys/socket.h>".}
 const MsgDontWait = (when defined(macosx): 0x80.cint else: 0x40.cint)
-  ## `MSG_DONTWAIT`, for `wsPeek`'s non-blocking recv: it replaces `wsRecv`'s
-  ## blocking `waitRead` so a peek never parks on an empty socket (EAGAIN
-  ## means nothing is buffered yet, not an error).
+  ## `MSG_DONTWAIT`: every recv here is non-blocking, whatever the fd's own
+  ## mode. EAGAIN means nothing is buffered yet, not an error.
 
-proc wsWriteAll*(ws: WsConn; data: string): bool {.passive.} =
-  ## Write `data` in full, handling short writes. Returns false on a write
-  ## error. Accumulates the connection's send counters: time suspended in
-  ## `waitWrite` (backpressure) and syscall count.
+const WsCloseGraceMs* = 5000
+  ## How long the keepalive's idle close gives its CLOSE frame before the
+  ## reaper shuts the socket down: the frame's write can itself stall on a
+  ## peer that stopped reading.
+
+# ── the write guard ─────────────────────────────────────────────────────
+
+const GuardParkCapMs = 50
+  ## Longest park of a writer waiting for the guard: at most about 20
+  ## wake-ups a second, however long the holder's write stalls.
+
+var gGuardParks: int64   ## accessed atomically; see `wsGuardParksTotal`
+
+proc wsGuardParksTotal*(): int64 =
+  ## Cumulative parks of writers waiting for another's frame to finish, for
+  ## tests and telemetry.
+  atomicLoad(gGuardParks)
+
+proc tryTakeWriteGuard(ws: WsConn): bool =
+  var expected = 0
+  result = atomicCompareExchange(ws.writeGuard, expected, 1)
+
+proc releaseWriteGuard(ws: WsConn) =
+  atomicStore(ws.writeGuard, 0)
+
+proc takeWriteGuard(ws: WsConn) {.passive.} =
+  ## Take the write guard, parking while it is held: 1 ms, doubling to
+  ## `GuardParkCapMs`. A writer that arrives while others are parked does
+  ## not try for the guard; it parks too, starting at the longest park so
+  ## those already waiting retry first. So once the holder releases, a
+  ## parked writer gets the guard before any writer arriving fresh, and a
+  ## writer sending frames back to back hands over at its next frame.
+  ## Parked writers are not served in strict arrival order.
+  var got = false
+  let parked = atomicLoad(ws.guardWaiters)
+  if parked == 0:
+    got = tryTakeWriteGuard(ws)
+  if not got:
+    let ahead = atomicFetchAdd(ws.guardWaiters, 1)
+    var nap = if ahead == 0: 1 else: GuardParkCapMs
+    while not got:
+      discard atomicFetchAdd(gGuardParks, 1'i64)
+      sleepMs(nap)
+      nap = min(nap * 2, GuardParkCapMs)
+      got = tryTakeWriteGuard(ws)
+    discard atomicFetchSub(ws.guardWaiters, 1)
+
+# ── the leaf writers ────────────────────────────────────────────────────
+
+proc frameOpcode(data: string): int =
+  ## The opcode of the frame `data` starts with, or -1 when it is empty.
+  result = if data.len > 0: int(uint8(data[0]) and 0x0F'u8) else: -1
+
+proc writeAllUnguarded(ws: WsConn; data: string): bool {.passive.} =
+  ## `wsWriteAll`'s write, for a caller that holds the guard.
   result = true
   var wbuf = default(array[4096, char])
   var off = 0
@@ -49,12 +114,30 @@ proc wsWriteAll*(ws: WsConn; data: string): bool {.passive.} =
         wOff = wOff + w
     off = off + clen
 
+proc wsWriteAll*(ws: WsConn; data: string): bool {.passive.} =
+  ## Write the frame `data` in full, handling short writes, holding the
+  ## write guard throughout; waits its turn while another task's frame is
+  ## being written. Once a CLOSE has gone out, a data frame (text, binary or
+  ## continuation) is refused without writing anything; control frames
+  ## still go. Returns false on a write error or a refusal. Accumulates the
+  ## connection's send counters: time suspended in `waitWrite`
+  ## (backpressure) and syscall count.
+  takeWriteGuard(ws)
+  let op = frameOpcode(data)
+  if ws.closeWritten and op >= 0 and op <= 2:
+    result = false
+  else:
+    result = writeAllUnguarded(ws, data)
+    if op == 8: ws.closeWritten = true
+  releaseWriteGuard(ws)
+
 proc wsEmitCtl(ws: WsConn; frame: string; lane = lnUrgent;
                coalesce = false): bool {.passive.} =
   ## Emit a complete, pre-serialized control frame (PONG / CLOSE). In queued
   ## mode (`ws.hasOutq`) this enqueues onto `lane` instead of writing the fd
   ## directly, so the writer loop stays the only task that touches the socket
-  ## — a direct write here would race it. Not queued: the plain inline write.
+  ## — a direct write here would race it. Not queued: `wsWriteAll`, which
+  ## waits for any frame another task is writing.
   ##
   ## Callers pick the lane deliberately: PONG is liveness and must not wait
   ## behind data, so it goes `lnUrgent`. CLOSE must not jump ahead of a
@@ -104,11 +187,14 @@ proc fillSendBuf(ws: WsConn; op: Opcode; data: openArray[byte]): int =
 
 proc writeSendBuf(ws: WsConn; total: int): bool {.passive.} =
   ## Write the first `total` bytes of the send buffer in one pass, handling
-  ## short writes. Updates `ws.writeSyscalls` and `ws.sendBlockedNs` on every
-  ## `waitWrite`; false once the peer is gone.
-  result = true
+  ## short writes, holding the write guard throughout; refused (false,
+  ## nothing written) once a CLOSE has gone out. Updates
+  ## `ws.writeSyscalls` and `ws.sendBlockedNs` on every `waitWrite`; false
+  ## once the peer is gone.
+  takeWriteGuard(ws)
+  result = not ws.closeWritten
   var off = 0
-  var cont = true
+  var cont = result
   while off < total and cont:
     let t0 = getMonoTime()
     let w = waitWrite(ws.fd, addr ws.sbuf[off], total - off)
@@ -119,6 +205,7 @@ proc writeSendBuf(ws: WsConn; total: int): bool {.passive.} =
       cont = false
     else:
       off = off + w
+  releaseWriteGuard(ws)
 
 proc wsSend*(ws: WsConn; data: string; binary = false): bool {.passive.} =
   ## Send one data message (text by default, binary if `binary`). Header and
@@ -152,6 +239,118 @@ proc wsClose*(ws: WsConn; code = 1000; reason = ""): bool {.passive.} =
   ws.open = false
   result = wsEmitCtl(ws, serializeFrame(opClose, closeFrameBody(code) & reason), lnControl)
 
+# ── the keepalive ───────────────────────────────────────────────────────
+
+const InboundIdle = -3
+  ## `awaitInbound`'s answer when the idle close fired.
+
+type KeepaliveStep = enum
+  ksNone      ## nothing due
+  ksPing      ## a keepalive PING is due
+  ksIdle      ## the idle timeout has passed
+
+proc recvNow(ws: WsConn): int =
+  ## Non-blocking recv into `ws.rbuf`: the bytes read, 0 when the peer has
+  ## closed, `ReadLater` when nothing has arrived, -1 on an error.
+  result = ReadLater
+  var done = false
+  while not done:
+    let n = pcall(cRecv(ws.fd, addr ws.rbuf[0], csize_t(ws.rbuf.len), MsgDontWait))
+    if n >= 0:
+      result = int(n)
+      done = true
+    elif n == -clong(EAGAIN): done = true
+    elif n != -clong(EINTR):
+      result = -1
+      done = true
+
+proc msLeft(since: int64; intervalMs: int; now: int64): int =
+  ## Milliseconds from `now` until `intervalMs` after `since`, both
+  ## monotonic ns; 0 or less once that has passed. Whole elapsed
+  ## milliseconds only, so "passed" means at least `intervalMs` went by.
+  let elapsedMs = (now - since) div 1_000_000'i64
+  result = if elapsedMs >= int64(intervalMs): 0 else: intervalMs - int(elapsedMs)
+
+proc keepaliveWaitMs(ws: WsConn; now: int64): int =
+  ## How long a parked read may wait before its next keepalive step:
+  ## the nearer of the next PING and the idle timeout, at most
+  ## `MaxKeepalivePollMs`; -1 (no deadline) when both are off.
+  let ping = gServerConfig.wsPingIntervalMs
+  let idle = gServerConfig.wsIdleTimeoutMs
+  if ping <= 0 and idle <= 0: return -1
+  var cap = gServerConfig.wsKeepalivePollMs
+  if cap <= 0 or cap > MaxKeepalivePollMs: cap = MaxKeepalivePollMs
+  result = cap
+  if ping > 0:
+    result = min(result, max(0, msLeft(max(ws.lastInbound, ws.lastPingSent), ping, now)))
+  if idle > 0:
+    result = min(result, max(0, msLeft(ws.lastInbound, idle, now)))
+
+proc keepaliveStep(ws: WsConn; now: int64): KeepaliveStep =
+  ## What a timed-out wait owes: the idle close first, then a PING.
+  let ping = gServerConfig.wsPingIntervalMs
+  let idle = gServerConfig.wsIdleTimeoutMs
+  if idle > 0 and msLeft(ws.lastInbound, idle, now) <= 0:
+    result = ksIdle
+  elif ping > 0 and msLeft(max(ws.lastInbound, ws.lastPingSent), ping, now) <= 0:
+    result = ksPing
+  else:
+    result = ksNone
+
+proc keepalivePing(ws: WsConn): bool {.passive.} =
+  ## Send a keepalive PING unless the connection is closing or the peer is
+  ## part-way through a frame (`ws.acc` holds a partial one); false only when
+  ## the write or the enqueue failed. In direct mode it waits its turn on the
+  ## write guard; in queued mode it goes on the CONTROL lane and does not
+  ## coalesce, so it never evicts a PONG the peer is owed. The clock
+  ## restarts either way, so a skipped PING is not retried at once.
+  result = true
+  ws.lastPingSent = getMonoTime().ticks
+  if ws.open and ws.acc.len == 0:
+    result = wsEmitCtl(ws, serializeFrame(opPing, ""), lnControl)
+
+proc idleClose(ws: WsConn): int {.passive.} =
+  ## The idle timeout: arm the reap backstop (left armed; teardown's
+  ## `clearConn` disarms it), mark the connection closed, then send CLOSE
+  ## 1001 unless a CLOSE already went out. In direct mode the CLOSE waits
+  ## its turn on the write guard; a writer stalled on a peer that stopped
+  ## reading is cut off by the backstop or `TCP_USER_TIMEOUT`. Counts the
+  ## close. Returns `InboundIdle`.
+  setDeadline(ws.fd, getMonoTime().ticks + int64(WsCloseGraceMs) * 1_000_000'i64)
+  let wasOpen = ws.open
+  ws.open = false
+  if wasOpen:
+    discard wsEmitCtl(ws, serializeFrame(opClose, closeFrameBody(1001)), lnControl)
+  countWsIdleClose()
+  result = InboundIdle
+
+proc awaitInbound(ws: WsConn): int {.passive.} =
+  ## Read into `ws.rbuf`, parking while nothing has arrived, and run the
+  ## keepalive while parked. Returns the bytes read, 0 when the peer has
+  ## closed, -1 on an error, or `InboundIdle` once the idle close fired.
+  ##
+  ## Each park is a readiness wait with a deadline (`waitReadableUntil`),
+  ## never a read with one: a buffer handed to the ring must not outlive the
+  ## wait.
+  result = recvNow(ws)
+  while result == ReadLater:
+    let wait = keepaliveWaitMs(ws, getMonoTime().ticks)
+    let r = waitReadableUntil(ws.fd, wait)
+    if r == IoTimedOut:
+      let step = keepaliveStep(ws, getMonoTime().ticks)
+      if step == ksIdle:
+        # Bytes may have landed after the deadline; they win over the close.
+        result = recvNow(ws)
+        if result == ReadLater:
+          result = idleClose(ws)
+      elif step == ksPing:
+        let sent = keepalivePing(ws)
+        if not sent: result = -1
+    elif r < 0:
+      result = -1
+    else:
+      result = recvNow(ws)
+
 proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
   ## The receive loop behind `wsRecv` and `wsPeek`: parse frames from the
   ## inbound buffer, reading more when a frame is incomplete, until a
@@ -160,9 +359,18 @@ proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
   ## yields `wmClose`, with `ws.open` already false. The limits are the
   ## server config's.
   ##
-  ## `blocking` reads park in `waitRead`; otherwise the read is a
-  ## `MSG_DONTWAIT` recv and an empty socket yields `wmNone` instead of
-  ## suspending. A real recv error other than EAGAIN also yields `wmNone`
+  ## Every inbound byte, whichever call read it, restarts the keepalive
+  ## clocks (`ws.lastInbound`). A `blocking` read parks until bytes arrive
+  ## and meanwhile keeps the connection alive: once `wsPingIntervalMs` has
+  ## passed since the later of the last inbound byte and the last PING, it
+  ## sends a PING; once `wsIdleTimeoutMs` has passed with nothing inbound,
+  ## it sends CLOSE 1001 and yields `wmClose`, with `ws.open` false. Only
+  ## inbound bytes count: a successful write proves only that the kernel
+  ## buffered it.
+  ##
+  ## A non-blocking read is a `MSG_DONTWAIT` recv: an empty socket yields
+  ## `wmNone` instead of suspending, and it never pings or closes for
+  ## idleness. A real recv error other than EAGAIN also yields `wmNone`
   ## there; it resurfaces on the next blocking send or recv.
   result = WsMessage(kind: wmClose, data: "")
   var done = false
@@ -171,17 +379,12 @@ proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
     let pr = parseFrame(ws.acc, 0, f, gServerConfig.maxWsPayload)
     if pr[0] == psIncomplete:
       var n = 0
-      if blocking:
-        # Same discipline as the HTTP driver's `waitFill`: arm the idle
-        # deadline for the duration of the wait and disarm the instant the
-        # read returns, so a silent peer is reaped like a silent HTTP one.
-        let w = gServerConfig.idleTimeoutMs
-        if w > 0: setDeadline(ws.fd, getMonoTime().ticks + w.int64 * 1_000_000'i64)
-        n = waitRead(ws.fd, addr ws.rbuf[0], ws.rbuf.len)
-        if w > 0: setDeadline(ws.fd, 0'i64)
-      else:
-        n = cRecv(ws.fd, addr ws.rbuf[0], csize_t(ws.rbuf.len), MsgDontWait)
-      if n == 0 or (n < 0 and blocking):
+      if blocking: n = awaitInbound(ws)
+      else: n = recvNow(ws)
+      if n == InboundIdle:
+        result = WsMessage(kind: wmClose, data: "")
+        done = true
+      elif n == 0 or (n < 0 and blocking):
         ws.open = false
         result = WsMessage(kind: wmClose, data: "")
         done = true
@@ -191,6 +394,7 @@ proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
       else:
         addInflight(n)
         appendBytes(ws.acc, addr ws.rbuf[0], n)
+        ws.lastInbound = getMonoTime().ticks
     elif pr[0] == psError:
       discard wsEmitCtl(ws, serializeFrame(opClose, closeFrameBody(1002)), lnControl)
       ws.open = false
@@ -221,7 +425,10 @@ proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
 
 proc wsRecv*(ws: WsConn): WsMessage {.passive.} =
   ## Block until the next complete data message, or a close/EOF. On
-  ## `wmClose`, `ws.open` is already false. A message a prior `wsPeek`
+  ## `wmClose`, `ws.open` is already false. While it waits it runs the
+  ## keepalive (see `ServerConfig.wsPingIntervalMs` / `wsIdleTimeoutMs`):
+  ## a quiet peer is pinged, and one silent past the idle timeout gets
+  ## CLOSE 1001 and this returns `wmClose`. A message a prior `wsPeek`
   ## stashed on the connection is delivered (and cleared) before touching
   ## the socket, so a peeked-but-not-skipped message (e.g. a control message
   ## that arrived mid-stream) is returned here unchanged.
@@ -235,10 +442,12 @@ proc wsRecv*(ws: WsConn): WsMessage {.passive.} =
 proc wsPeek*(ws: WsConn): WsMessage {.passive.} =
   ## Non-blocking look at the next complete data message: an empty socket
   ## yields `wmNone` (nothing complete buffered) instead of suspending. A
-  ## pong reply can still suspend under send backpressure. A complete data
-  ## message is drained from the buffer and stashed on the connection: this
-  ## call and every following `wsPeek` return it unchanged until `wsSkip`
-  ## discards it or `wsRecv` delivers it.
+  ## pong reply can still suspend, under send backpressure or behind another
+  ## task's frame. Bytes it reads restart the keepalive clocks like any
+  ## inbound bytes, but it never pings or closes for idleness: only a parked
+  ## `wsRecv` does. A complete data message is drained from the buffer and
+  ## stashed on the connection: this call and every following `wsPeek`
+  ## return it unchanged until `wsSkip` discards it or `wsRecv` delivers it.
   if ws.hasPeeked:
     result = ws.peeked
   else:

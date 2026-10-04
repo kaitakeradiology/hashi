@@ -113,10 +113,12 @@ abort the process, which is why the parsers are fuzzed. See
 [`error-handling.md`](error-handling.md).
 
 **Limits and timeouts** live in `ServerConfig`: request-head and body
-caps, WebSocket payload and message caps, Nagle, kernel keepalive, and the
-idle reaper that shuts down a connection blocked on a read with no inbound
-bytes. Writes are never timed by the application; a stalled peer on the
-write side is the kernel's job via `TCP_USER_TIMEOUT`.
+caps, WebSocket payload and message caps, Nagle, kernel keepalive, the
+idle reaper that shuts down an HTTP connection blocked on a read with no
+inbound bytes, and the WebSocket keepalive. Writes are never timed by the
+application; a stalled peer on the write side is the kernel's job via
+`TCP_USER_TIMEOUT` (60 s by default). `serve` exits 1 on a config
+`validateServerConfig` rejects.
 
 **Client IP.** `setTrustedProxies` names the direct peers whose
 `X-Real-IP` and `X-Forwarded-For` are honoured. With none configured, the
@@ -140,6 +142,25 @@ ordinary response, the connection closes, and the handler never runs.
 `wsPeek` looks at the next complete message without blocking and stashes
 it; `wsSkip` discards the stash. `setAllowedOrigins` refuses upgrades from
 a browser `Origin` that is neither same-origin nor listed.
+
+**Keepalive.** While a handler is parked in `wsRecv`, the connection pings
+a quiet peer after `wsPingIntervalMs` (20 s) and again each interval, and
+after `wsIdleTimeoutMs` (60 s) with nothing inbound it sends CLOSE 1001 and
+`wsRecv` returns `wmClose`; `wsIdleClosedTotal` counts these. The clock is
+inbound-only: any byte from the peer, a PONG included, restarts it, and
+nothing the server sends does, since a successful write proves only that
+the kernel buffered it. So a server streaming to a peer that never answers
+still closes it at the idle timeout. A connection whose handler is not in
+`wsRecv` is not pinged, and nor is a peer part-way through sending a frame.
+Either knob at 0 turns that half off; the idle timeout must be at least
+twice the ping interval. A control frame the reader sends (PONG, PING,
+CLOSE) never lands inside a data frame another task is writing: each frame
+is written whole under a per-connection guard. The guard is fair to
+waiting writers, so a control frame waits its turn behind at most the
+frame being written, and once a CLOSE is written no data frame follows
+it. Two tasks sending data still need queued mode, below. A `WsConn` belongs to its handler: once the
+handler returns the driver closes the socket, and nothing may use the
+`WsConn` after that, from any task.
 
 **Several tasks, one socket.** A connection written by more than one task
 (a reply handler plus a background stream, say) goes into queued mode:

@@ -7,7 +7,9 @@
 ## runs, and any inbound byte resets it. A recurring reaper sweep calls
 ## `reapExpired`, which `shutdown()`s any fd still armed past its deadline;
 ## that routes through the normal completion path, so the parked read returns
-## <=0 and the driver's existing unwind closes the fd.
+## <=0 and the driver's existing unwind closes the fd. The one exception is
+## the WebSocket keepalive's idle close: it arms a deadline as a backstop
+## for its own CLOSE and leaves it armed for teardown's `clearConn`.
 ##
 ## The byte count is the aggregate bound the per-connection caps cannot give:
 ## every read adds (`addInflight`), every consumed or dropped byte subtracts
@@ -42,6 +44,7 @@ const SHUT_RDWR = 2.cint
 
 var gDeadline: array[MaxFds, int64]   ## 0 = not watched; else the deadline in monotonic ticks.
 var gReapCount: int64                 ## Total connections reaped, for `reapedTotal`.
+var gWsIdleCloseCount: int64          ## WebSocket idle closes, for `wsIdleClosedTotal`.
 var gInflight: int64                  ## Bytes buffered across connections, not yet consumed.
 
 proc addInflight*(n: int) =
@@ -90,3 +93,13 @@ proc reapExpired*(nowNanos: int64): int =
 proc reapedTotal*(): int64 =
   ## Cumulative connections reaped since boot (for app /metrics).
   atomicLoad(gReapCount)
+
+proc countWsIdleClose*() =
+  ## Record one WebSocket closed by its keepalive for inbound silence.
+  discard atomicFetchAdd(gWsIdleCloseCount, 1'i64)
+
+proc wsIdleClosedTotal*(): int64 =
+  ## Cumulative WebSockets closed for inbound silence (`wsIdleTimeoutMs`)
+  ## since boot, for app /metrics. Counted apart from `reapedTotal`: the
+  ## keepalive closes these itself, with a CLOSE 1001.
+  atomicLoad(gWsIdleCloseCount)

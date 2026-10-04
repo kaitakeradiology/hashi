@@ -53,12 +53,15 @@ upgraded sockets were never armed and a stalled WS peer was kept forever —
 the invariant connreg's doc states for "the connection driver" did not hold
 for the WS layer.
 
-Fix: the blocking WS read now arms the same deadline for the duration of the
-wait, exactly as the HTTP driver's `waitFill` does (`tests/test_ws_idle.nim`
-pins it end to end over a socketpair). Note what this means for apps: a WS
-connection silent at the socket level for longer than `idleTimeoutMs` is now
-closed by default — an app with quiet streams sends app-level keepalives or
-raises/zeroes the timeout.
+Fix: WebSocket reads have their own keepalive instead of the HTTP idle
+reaper. A parked `wsRecv` pings after `wsPingIntervalMs` (20 s) of inbound
+silence and, after `wsIdleTimeoutMs` (60 s), sends CLOSE 1001 and ends the
+connection, with a 5 s reap deadline as the backstop for that CLOSE's own
+write. Only inbound bytes reset the clock, so a peer that sends nothing cannot
+keep a connection open on the strength of the server's writes succeeding. A peer that
+stops reading altogether is the kernel's to drop: `TCP_USER_TIMEOUT` is now
+on by default (60 s). `tests/test_ws_idle.nim` and
+`tests/test_ws_backstop.nim` pin both ends.
 
 ### 4. 431/413 rejections can arrive as a reset, not the response — kept
 

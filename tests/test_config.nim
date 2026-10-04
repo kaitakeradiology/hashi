@@ -22,6 +22,46 @@ block: check d.idleTimeoutMs > 0, "the idle reaper is armed out of the box"
 block: check d.keepaliveIdleSec > 0 and d.keepaliveIntvlSec > 0 and d.keepaliveCnt > 0,
       "kernel dead-peer detection on by default"
 block: check d.maxInflightBytes > 0, "aggregate buffered-byte budget on by default"
+block: check d.userTimeoutMs == 60_000, "TCP_USER_TIMEOUT 60 s by default"
+block: check d.wsPingIntervalMs == 20_000, "WebSocket pings every 20 s of inbound silence"
+block: check d.wsIdleTimeoutMs == 60_000, "WebSocket idle close after 60 s of inbound silence"
+block: check d.wsKeepalivePollMs == MaxKeepalivePollMs, "keepalive waits capped at MaxKeepalivePollMs"
+block: check MaxKeepalivePollMs == 20_000, "MaxKeepalivePollMs is 20 s"
+
+section "validateServerConfig"
+block: check validateServerConfig(d) == "", "the defaults are valid"
+block:
+  var c = defaultServerConfig()
+  c.wsPingIntervalMs = 0
+  c.wsIdleTimeoutMs = 0
+  check validateServerConfig(c) == "", "keepalive off (0/0) is valid"
+block:
+  var c = defaultServerConfig()
+  c.wsPingIntervalMs = -1
+  check validateServerConfig(c) == "wsPingIntervalMs must not be negative (got -1)",
+        "a negative ping interval is refused"
+block:
+  var c = defaultServerConfig()
+  c.wsIdleTimeoutMs = -5
+  check validateServerConfig(c) == "wsIdleTimeoutMs must not be negative (got -5)",
+        "a negative idle timeout is refused"
+block:
+  var c = defaultServerConfig()
+  c.wsPingIntervalMs = 100
+  c.wsIdleTimeoutMs = 150
+  check validateServerConfig(c) ==
+        "wsIdleTimeoutMs (150) must be at least twice wsPingIntervalMs (100)",
+        "an idle timeout under two ping intervals is refused"
+block:
+  var c = defaultServerConfig()
+  c.wsPingIntervalMs = 100
+  c.wsIdleTimeoutMs = 200
+  check validateServerConfig(c) == "", "exactly two ping intervals is valid"
+block:
+  var c = defaultServerConfig()
+  c.wsPingIntervalMs = 0
+  c.wsIdleTimeoutMs = 50
+  check validateServerConfig(c) == "", "an idle close without pings is valid"
 
 section "inflight accounting"
 # The accept gate reads one number: bytes buffered across connections and not

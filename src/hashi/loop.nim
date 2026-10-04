@@ -11,7 +11,7 @@
 ## together with the continuation and a pointer to `result`, which lives in
 ## the suspended frame. An ioring worker performs the syscall, writes the
 ## count through the pointer and resumes the continuation; idle workers
-## block in the kernel.
+## block in the kernel. `waitReadableUntil` is the one wait with a deadline.
 ##
 ## Continuations resume on the worker pool, not on one thread, so state
 ## shared between handlers needs a lock. Import this module from any handler
@@ -110,6 +110,23 @@ proc waitWrite*(fd: cint; buf: pointer; len: int): int {.passive.} =
   result = -1
   let c = delay()
   discard submitWrite(fd, buf, len, never, c, addr result)
+  suspend()
+
+proc waitReadableUntil*(fd: cint; ms: int): int {.passive.} =
+  ## Suspend until `fd` is readable or `ms` milliseconds pass, whichever is
+  ## first; `ms < 0` waits with no deadline. Returns `IoTimedOut` when the
+  ## deadline passed first, another negative value when the wait itself
+  ## failed (`ECancelled` once the fd is closed under it), and otherwise a
+  ## value >= 0: the fd is readable, or has an error or hang-up pending that
+  ## the next read reports.
+  ##
+  ## Nothing is transferred. That is why this, and not `waitRead`, is the wait
+  ## to put a deadline on: a timed-out poll owns no memory, whereas a read
+  ## that times out on io_uring can still complete into its buffer later.
+  result = -1
+  let deadline = if ms < 0: never else: afterMs(ms)
+  let c = delay()
+  discard submitPollAdd(fd, deadline, {evRead}, c, addr result)
   suspend()
 
 const ReadLater* = -2
