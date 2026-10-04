@@ -1,4 +1,5 @@
-## Per-server configuration: size limits, TCP keepalive, and the idle reaper.
+## Per-server configuration: size limits, TCP keepalive, the idle reaper and
+## the WebSocket keepalive.
 ##
 ## Set once via `serve(port, config)` (or `setServerConfig`) before the
 ## reactor starts; the connection driver and the WebSocket session layer read
@@ -7,6 +8,8 @@
 ##
 ## Worker-thread count is not configured here: `std/threadpool.initPool`
 ## sizes the pool at run time, one worker fewer than `countProcessors()`.
+##
+## `serve` refuses to start on a config `validateServerConfig` rejects.
 
 import hashi/http/request
 import hashi/ws/frame
@@ -28,20 +31,48 @@ type
     keepaliveIdleSec*: int   ## SO_KEEPALIVE + TCP_KEEPIDLE (s); 0 = keepalive off.
     keepaliveIntvlSec*: int  ## TCP_KEEPINTVL (s) between probes; 0 = kernel default.
     keepaliveCnt*: int       ## TCP_KEEPCNT probes before drop; 0 = kernel default.
-    userTimeoutMs*: int      ## TCP_USER_TIMEOUT (ms): cap unacked data before reset; 0 = off.
-    # Application-level idle reaper (0 = disabled): bounds a connection blocked
-    # on a read with no inbound bytes, whether idle keep-alive between
+    userTimeoutMs*: int      ## TCP_USER_TIMEOUT (ms): reset a connection whose sent
+                             ## data stays unacknowledged, or whose peer keeps a
+                             ## zero window, this long; 0 = off. Applies to HTTP
+                             ## and WebSocket connections alike.
+    # Application-level idle reaper (0 = disabled): bounds an HTTP connection
+    # blocked on a read with no inbound bytes, whether idle keep-alive between
     # requests or a slowloris sending nothing. Any inbound byte resets the
     # window, so only genuine silence is reaped. See `hashi/http/connreg`.
-    idleTimeoutMs*: int      ## Max silence on a blocked read; 0 = off.
-    reapIntervalMs*: int     ## Reaper sweep period; 0 means 1000 while `idleTimeoutMs` is set.
+    # WebSocket reads are bounded by `wsIdleTimeoutMs` instead.
+    idleTimeoutMs*: int      ## Max silence on a blocked HTTP read; 0 = off.
+    reapIntervalMs*: int     ## Reaper sweep period; 0 means 1000 while `idleTimeoutMs`
+                             ## or `wsIdleTimeoutMs` is set.
     maxInflightBytes*: int   ## Refuse new connections at this many bytes buffered
                              ## across all connections (see `hashi/http/connreg`).
+    # WebSocket keepalive, run by a `wsRecv` parked for inbound bytes. Both
+    # clocks count from the last inbound byte only: a write succeeding proves
+    # just that the kernel buffered it. See `recvMessage` in
+    # `hashi/ws/session_io`.
+    wsPingIntervalMs*: int   ## Send a PING after this much inbound silence, and
+                             ## again each interval while it lasts; 0 = no pings.
+    wsIdleTimeoutMs*: int    ## After this much inbound silence send CLOSE 1001 and
+                             ## end the connection; 0 = never. At least twice
+                             ## `wsPingIntervalMs` when both are set, so a peer
+                             ## gets a ping before it can be closed.
+    wsKeepalivePollMs*: int  ## Longest single keepalive wait, clamped to
+                             ## 1..`MaxKeepalivePollMs` (<= 0 means the max).
+                             ## Lowered only by tests that measure the timer heap.
+
+const MaxKeepalivePollMs* = 20_000
+  ## Upper bound on one keepalive wait. Every wait is a ring poll with a
+  ## deadline, and `std/ioring` drops a finished poll's timer entry only once
+  ## it reaches the top of the lane's heap, so the heap holds every deadline
+  ## armed within the longest wait still pending. Capping the wait caps the
+  ## heap at roughly the poll rate times this, whatever the configured
+  ## intervals.
 
 proc defaultServerConfig*(): ServerConfig =
   ## The built-in defaults: size limits from each layer's own consts, the
-  ## idle reaper and kernel dead-peer detection on, and a 1 GiB aggregate
-  ## budget for bytes buffered across connections.
+  ## idle reaper and kernel dead-peer detection on (`TCP_USER_TIMEOUT`
+  ## 60 s), a 1 GiB aggregate budget for bytes buffered across connections,
+  ## and the WebSocket keepalive on: a PING after 20 s of inbound silence,
+  ## CLOSE 1001 after 60 s.
   result = ServerConfig(maxRequestHead: MaxRequestHead,
                         maxBodySize: MaxBodySize,
                         maxWsPayload: MaxWsPayload,
@@ -50,10 +81,27 @@ proc defaultServerConfig*(): ServerConfig =
                         keepaliveIdleSec: 60,
                         keepaliveIntvlSec: 10,
                         keepaliveCnt: 3,
-                        userTimeoutMs: 0,
+                        userTimeoutMs: 60_000,
                         idleTimeoutMs: 30_000,
                         reapIntervalMs: 0,
-                        maxInflightBytes: 1_073_741_824)
+                        maxInflightBytes: 1_073_741_824,
+                        wsPingIntervalMs: 20_000,
+                        wsIdleTimeoutMs: 60_000,
+                        wsKeepalivePollMs: MaxKeepalivePollMs)
+
+proc validateServerConfig*(c: ServerConfig): string =
+  ## "" when `c` is usable, else a one-line reason. Refuses a negative
+  ## `wsPingIntervalMs` or `wsIdleTimeoutMs`, and a `wsIdleTimeoutMs` under
+  ## twice `wsPingIntervalMs` when both are set.
+  result = ""
+  if c.wsPingIntervalMs < 0:
+    result = "wsPingIntervalMs must not be negative (got " & $c.wsPingIntervalMs & ")"
+  elif c.wsIdleTimeoutMs < 0:
+    result = "wsIdleTimeoutMs must not be negative (got " & $c.wsIdleTimeoutMs & ")"
+  elif c.wsPingIntervalMs > 0 and c.wsIdleTimeoutMs > 0 and
+       c.wsIdleTimeoutMs div 2 < c.wsPingIntervalMs:     # idle < 2 * ping, without overflow
+    result = "wsIdleTimeoutMs (" & $c.wsIdleTimeoutMs &
+             ") must be at least twice wsPingIntervalMs (" & $c.wsPingIntervalMs & ")"
 
 var gServerConfig* = defaultServerConfig()
   ## The active config. Set before `serve`; read-only during serving.

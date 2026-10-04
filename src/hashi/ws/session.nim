@@ -13,7 +13,7 @@
 
 {.feature: "lenientnils".}   # `outq` is nil until `useOutQueue`
 
-import std/[uri, strutils]
+import std/[uri, strutils, monotimes]
 import hashi/ws/protocol
 import hashi/ws/outq
 import hashi/ws/outq_pacing
@@ -55,6 +55,17 @@ type
     outq*: OutQueue               ## nil until `useOutQueue` installs one; valid iff `hasOutq`
     hasOutq*: bool                ## true once queued mode is on: all writes go through the
                                   ## queue's single writer instead of the fd directly
+    # Keepalive clocks (monotonic ns, `getMonoTime().ticks`); see `recvMessage`
+    # in `hashi/ws/session_io`.
+    lastInbound*: int64           ## when bytes last arrived; set at upgrade
+    lastPingSent*: int64          ## when a keepalive PING last fell due, sent or not
+    writeGuard*: int              ## write guard: 1 while a leaf writer in
+                                  ## `hashi/ws/session_io` owns the socket's write side,
+                                  ## so frames never interleave; fair to parked writers.
+                                  ## Accessed atomically, and only by those writers.
+    guardWaiters*: int            ## writers parked for `writeGuard`; accessed atomically
+    closeWritten*: bool           ## a CLOSE frame has been written: no data frame may
+                                  ## follow. Read and set under `writeGuard`.
 
   WsHandler* = proc(ws: WsConn) {.passive.}
     ## App handler. Called once per upgraded connection; owns it until it returns.
@@ -77,15 +88,19 @@ proc newWsConn*(fd: cint; initial: string; clientIp = "";
   ## resolved peer address for app logging. `cookie`/`path` carry the upgrade
   ## request's `Cookie` header + request-target so the handler can authenticate
   ## the connection and route by path (passive handlers never see the Request).
+  let now = getMonoTime().ticks
   result = WsConn(fd: fd, acc: initial, st: default(WsState), open: true,
                   clientIp: clientIp, cookie: cookie, path: path, sbuf: @[],
                   peeked: WsMessage(kind: wmNone, data: ""), hasPeeked: false,
+                  lastInbound: now, lastPingSent: now, writeGuard: 0,
+                  guardWaiters: 0, closeWritten: false,
                   hasOutq: false)
 
 proc useOutQueue*(ws: WsConn; q: OutQueue) =
-  ## Put this connection into queued mode: `wsRecv`/`wsPeek`/`wsSend`/`wsClose`
-  ## stop writing to the socket directly and enqueue onto `q` instead, so the
-  ## writer loop is the only task that ever touches the fd. The caller must
+  ## Put this connection into queued mode: `wsRecv`/`wsPeek`/`wsClose` stop
+  ## writing to the socket directly and enqueue onto `q` instead, so the
+  ## writer loop is the only task that ever touches the fd. `wsSend` still
+  ## writes directly (the writer loop uses it); producers call `wsEnqueue`. The caller must
   ## then run `wsWriterLoop(ws, q)` (see `hashi/ws/outq_writer`) as its own
   ## task and join it before the driver closes the fd.
   ##

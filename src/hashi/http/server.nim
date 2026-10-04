@@ -521,7 +521,9 @@ proc acceptLoop(listenFd: cint; extraIdx: int) {.passive.} =
 
 proc reaperLoop() {.passive.} =
   ## Periodic sweep that shuts down connections stalled past their armed
-  ## deadline (`connreg`). Spawned only when an idle timeout is configured.
+  ## deadline (`connreg`). Spawned only when `idleTimeoutMs` or
+  ## `wsIdleTimeoutMs` is set: the WebSocket idle close arms a deadline as
+  ## the backstop for its own CLOSE.
   var interval = gServerConfig.reapIntervalMs
   if interval <= 0: interval = 1000
   while true:
@@ -550,6 +552,13 @@ proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
   ## `bindAddr` is an address literal, never a hostname: "" or "::" for the
   ## dual-stack wildcard, "0.0.0.0" for IPv4 only, or a specific address such
   ## as "127.0.0.1" for loopback only. See `tryListenTcp`.
+  ##
+  ## A config `validateServerConfig` rejects is logged at error level and
+  ## the process exits 1 before anything listens.
+  let bad = validateServerConfig(config)
+  if bad.len > 0:
+    log(LogLevel.error, "hashi http: invalid server config — " & bad)
+    quit(1)
   setServerConfig(config)
   ignoreSigpipe()
   initLoop()
@@ -559,7 +568,8 @@ proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
     let efd = listenOrQuit(gExtra[e].port, gExtra[e].bindAddr, " (ws-only)")
     spawnTask acceptLoop(efd, e)
   if hasBootTask(): spawnTask bootRunner()
-  if gServerConfig.idleTimeoutMs > 0:
-    log(info, "hashi http: idle reaper on (idle=" & $gServerConfig.idleTimeoutMs & "ms)")
+  if gServerConfig.idleTimeoutMs > 0 or gServerConfig.wsIdleTimeoutMs > 0:
+    log(info, "hashi http: idle reaper on (idle=" & $gServerConfig.idleTimeoutMs &
+              "ms, ws idle=" & $gServerConfig.wsIdleTimeoutMs & "ms)")
     spawnTask reaperLoop()
   runLoop()

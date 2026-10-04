@@ -13,7 +13,15 @@ notes.
 - `maxInflightBytes` (`hashi/http/config`) and the byte count it gates on
   (`hashi/http/connreg`): the acceptor refuses new connections at an
   aggregate budget of bytes buffered across all connections.
-- `tests/test_ws_idle.nim`: the idle reaper covers WebSocket reads.
+- WebSocket keepalive: a `wsRecv` parked on a quiet peer sends a PING
+  every `wsPingIntervalMs` (default 20 s) of inbound silence and, after
+  `wsIdleTimeoutMs` (default 60 s), CLOSE 1001 and returns `wmClose`.
+  Only inbound bytes reset the clock. `wsIdleClosedTotal`
+  (`hashi/http/connreg`) counts these closes.
+- `waitReadableUntil` (`hashi/loop`): wait for an fd to become readable,
+  with a deadline.
+- `validateServerConfig` (`hashi/http/config`); `serve` logs the reason and
+  exits 1 on a config it rejects.
 
 ### Changed
 
@@ -21,8 +29,16 @@ notes.
   incomplete; the driver resumes rather than restarts, so a chunked body
   arriving in N reads costs one pass, not N (was O(n²) in body size).
 - `defaultServerConfig` ships the idle reaper (30 s) and kernel dead-peer
-  detection (60/10/3) on; a WS connection silent at the socket level for
-  longer than `idleTimeoutMs` is now closed by default.
+  detection (60/10/3) on. The reaper's `idleTimeoutMs` covers HTTP reads
+  only; WebSocket reads are covered by the keepalive above.
+- `userTimeoutMs` (`TCP_USER_TIMEOUT`) defaults to 60 s, was off: a
+  connection, HTTP or WebSocket, whose sent data stays unacknowledged or
+  whose peer holds a zero window for 60 s is reset by the kernel.
+- Each WebSocket frame is written whole under a per-connection guard, fair
+  to waiting writers, so the reader's PONG, PING or CLOSE no longer lands
+  inside a data frame another task is part-way through writing, nor waits
+  indefinitely behind one; once a CLOSE has been written, data frames are
+  refused (`wsSend`/`wsWriteAll` return false).
 
 ### Security
 

@@ -121,6 +121,57 @@ proc yieldsResume() =
   section "yieldTask"
   check atomicLoad(gYields, moAcquire) == 1000, "a task that yields 1000 times runs to the end"
 
+var gPollRes: int      # accessed atomically
+var gPollMs: int       # accessed atomically
+var gPollDone: int     # accessed atomically
+
+proc poller(fd: cint; ms: int) {.passive.} =
+  let t0 = getMonoTime().ticks
+  let r = waitReadableUntil(fd, ms)
+  atomicStore(gPollMs, int((getMonoTime().ticks - t0) div 1_000_000), moRelease)
+  atomicStore(gPollRes, r, moRelease)
+  atomicStore(gPollDone, 1, moRelease)
+
+proc runPoller(fd: cint; ms: int; feed: int; feedFd: cint) =
+  ## Start `poller`, write a byte to `feedFd` after `feed` ms (never when
+  ## negative), and wait for the poller to return.
+  atomicStore(gPollDone, 0, moRelease)
+  let t0 = getMonoTime().ticks
+  spawnTask poller(fd, ms)
+  var fed = false
+  var turns = 0
+  while atomicLoad(gPollDone, moAcquire) == 0 and turns < 5000:
+    workTurn()
+    if not fed and feed >= 0 and (getMonoTime().ticks - t0) div 1_000_000 >= feed:
+      var b = default(array[1, char])
+      b[0] = 'x'
+      discard write(feedFd, addr b[0], 1)
+      fed = true
+    turns = turns + 1
+
+proc readableUntilCases() =
+  ## `waitReadableUntil` returns once the fd is readable or the deadline
+  ## passes, whichever is first, and transfers nothing.
+  var sv = default(array[2, cint])
+  discard cSocketpair(AfUnix, SockStream, 0.cint, addr sv[0])
+  setNonBlocking(sv[0])
+  setNonBlocking(sv[1])
+  section "waitReadableUntil"
+  runPoller(sv[0], 100, -1, sv[1])
+  check atomicLoad(gPollRes, moAcquire) == IoTimedOut, "a silent fd times out with IoTimedOut"
+  let waited = atomicLoad(gPollMs, moAcquire)
+  check waited >= 90 and waited < 1000, "after about the deadline (" & $waited & " ms)"
+  runPoller(sv[0], 5000, 20, sv[1])
+  check atomicLoad(gPollRes, moAcquire) > 0, "a byte arriving first makes it return > 0"
+  check atomicLoad(gPollMs, moAcquire) < 1000, "promptly, not at the deadline"
+  var buf = default(array[8, char])
+  check readNow(sv[0], addr buf[0], buf.len) == 1, "and the byte is still there to read"
+  runPoller(sv[0], -1, 20, sv[1])
+  check atomicLoad(gPollRes, moAcquire) > 0, "ms < 0 waits with no deadline"
+  discard readNow(sv[0], addr buf[0], buf.len)
+  discard close(sv[0])
+  discard close(sv[1])
+
 proc main() =
   discard cAlarm(10)
   readNowCases()
@@ -128,6 +179,7 @@ proc main() =
   spawnReturnsAtOnce()
   mainTakesTurns()
   yieldsResume()
+  readableUntilCases()
   var ok = 0
   var i = 0
   while i < 10:
