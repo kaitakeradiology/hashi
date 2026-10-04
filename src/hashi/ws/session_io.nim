@@ -12,6 +12,7 @@ import hashi/loop
 import hashi/buffer
 import hashi/http/request
 import hashi/http/config
+import hashi/http/connreg   # setDeadline, addInflight/subInflight
 import hashi/ws/frame
 import hashi/ws/protocol
 import hashi/ws/session
@@ -69,8 +70,10 @@ proc wsEmitCtl(ws: WsConn; frame: string; lane = lnUrgent;
 
 proc wsConsume(ws: WsConn; consumed: int) =
   ## Drop the first `consumed` (parsed) bytes from the inbound buffer. Frees the
-  ## large buffer before the caller builds/echoes — keeps peak memory down.
+  ## large buffer before the caller builds/echoes — keeps peak memory down —
+  ## and stops counting them.
   dropPrefix(ws.acc, consumed)
+  subInflight(consumed)
 
 proc fillSendBuf(ws: WsConn; op: Opcode; data: string): int =
   ## Non-passive: build [frame header | payload] into the connection's reusable
@@ -180,6 +183,7 @@ proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
         result = WsMessage(kind: wmNone, data: "")
         done = true
       else:
+        addInflight(n)
         appendBytes(ws.acc, addr ws.rbuf[0], n)
     elif pr[0] == psError:
       discard wsEmitCtl(ws, serializeFrame(opClose, closeFrameBody(1002)), lnControl)

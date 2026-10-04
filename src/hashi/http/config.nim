@@ -35,21 +35,25 @@ type
     # window, so only genuine silence is reaped. See `hashi/http/connreg`.
     idleTimeoutMs*: int      ## Max silence on a blocked read; 0 = off.
     reapIntervalMs*: int     ## Reaper sweep period; 0 means 1000 while `idleTimeoutMs` is set.
+    maxInflightBytes*: int   ## Refuse new connections at this many bytes buffered
+                             ## across all connections (see `hashi/http/connreg`).
 
 proc defaultServerConfig*(): ServerConfig =
-  ## The built-in defaults: size limits from each layer's own consts, TCP
-  ## keepalive and the idle reaper off.
+  ## The built-in defaults: size limits from each layer's own consts, the
+  ## idle reaper and kernel dead-peer detection on, and a 1 GiB aggregate
+  ## budget for bytes buffered across connections.
   result = ServerConfig(maxRequestHead: MaxRequestHead,
                         maxBodySize: MaxBodySize,
                         maxWsPayload: MaxWsPayload,
                         maxWsMessage: MaxWsMessage,
                         tcpNoDelay: true,
-                        keepaliveIdleSec: 0,
-                        keepaliveIntvlSec: 0,
-                        keepaliveCnt: 0,
+                        keepaliveIdleSec: 60,
+                        keepaliveIntvlSec: 10,
+                        keepaliveCnt: 3,
                         userTimeoutMs: 0,
-                        idleTimeoutMs: 0,
-                        reapIntervalMs: 0)
+                        idleTimeoutMs: 30_000,
+                        reapIntervalMs: 0,
+                        maxInflightBytes: 1_073_741_824)
 
 var gServerConfig* = defaultServerConfig()
   ## The active config. Set before `serve`; read-only during serving.
