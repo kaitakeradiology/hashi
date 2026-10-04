@@ -1,4 +1,5 @@
-## Per-fd deadline registry for the idle-connection reaper.
+## Per-fd deadline registry for the idle-connection reaper, and the
+## process-wide count of buffered-but-unconsumed bytes the acceptor gates on.
 ##
 ## The connection driver arms a deadline on an fd immediately before it blocks
 ## on a read and disarms it the instant the read returns, so a connection is
@@ -7,6 +8,12 @@
 ## `reapExpired`, which `shutdown()`s any fd still armed past its deadline;
 ## that routes through the normal completion path, so the parked read returns
 ## <=0 and the driver's existing unwind closes the fd.
+##
+## The byte count is the aggregate bound the per-connection caps cannot give:
+## every read adds (`addInflight`), every consumed or dropped byte subtracts
+## (`subInflight`), and the acceptor refuses new connections at
+## `ServerConfig.maxInflightBytes` so many part-buffered requests cannot
+## outgrow the machine.
 ##
 ## Writes are intentionally not timed. A write blocks under TCP flow control
 ## until the peer's window reopens, which for a slow-but-alive reader can be
@@ -35,6 +42,22 @@ const SHUT_RDWR = 2.cint
 
 var gDeadline: array[MaxFds, int64]   ## 0 = not watched; else the deadline in monotonic ticks.
 var gReapCount: int64                 ## Total connections reaped, for `reapedTotal`.
+var gInflight: int64                  ## Bytes buffered across connections, not yet consumed.
+
+proc addInflight*(n: int) =
+  ## Count `n` bytes read into a connection buffer.
+  if n > 0: discard atomicFetchAdd(gInflight, int64(n))
+
+proc subInflight*(n: int) =
+  ## Stop counting `n` bytes: consumed by a parser, or dropped at teardown.
+  if n > 0: discard atomicFetchSub(gInflight, int64(n))
+
+proc inflightBytes*(): int64 =
+  ## Total bytes buffered across all connections and not yet consumed by a
+  ## parser. The per-connection caps bound one connection; this bounds all
+  ## of them at once, and the acceptor refuses new connections at
+  ## `ServerConfig.maxInflightBytes`.
+  atomicLoad(gInflight)
 
 proc setDeadline*(fd: cint; deadlineNanos: int64) =
   ## Arm (deadlineNanos > 0) or disarm (0) the reap deadline for `fd`.

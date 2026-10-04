@@ -191,7 +191,9 @@ type
 proc fillNow(c: Conn): int =
   ## Append to `c.acc` what has already arrived: `readNow`'s answer.
   result = readNow(c.fd, addr c.rbuf[0], c.rbuf.len)
-  if result > 0: appendBytes(c.acc, addr c.rbuf[0], result)
+  if result > 0:
+    addInflight(result)
+    appendBytes(c.acc, addr c.rbuf[0], result)
 
 proc waitFill(c: Conn): int {.passive.} =
   ## Wait on the ring for the next read into `c.acc`, with the idle deadline
@@ -204,7 +206,9 @@ proc waitFill(c: Conn): int {.passive.} =
   if w > 0: setDeadline(c.fd, getMonoTime().ticks + w.int64 * 1_000_000'i64)
   result = waitRead(c.fd, addr c.rbuf[0], c.rbuf.len)
   if w > 0: setDeadline(c.fd, 0'i64)
-  if result > 0: appendBytes(c.acc, addr c.rbuf[0], result)
+  if result > 0:
+    addInflight(result)
+    appendBytes(c.acc, addr c.rbuf[0], result)
 
 proc reject(c: Conn; status: int) {.passive.} =
   ## Answer `status` with an empty body; the caller ends the connection.
@@ -352,6 +356,11 @@ proc upgradeToWs(c: Conn; req: Request; ip: string; extraIdx: int) {.passive.} =
   log(info, ip & " connected")
   let ws = newWsConn(c.fd, substr(c.acc, req.headBytes), ip,
                      header(req, "Cookie"), req.target)
+  # The connection's bytes now live in `ws.acc` (a copy of the leftover);
+  # the count moves with them, and the driver's buffer releases whole.
+  subInflight(c.acc.len)
+  c.acc.setLen(0)
+  addInflight(ws.acc.len)
   if extraIdx >= 0:
     if extraIdx < gExtra.len:
       # Through a local: a passive proc value called straight off a seq
@@ -362,6 +371,7 @@ proc upgradeToWs(c: Conn; req: Request; ip: string; extraIdx: int) {.passive.} =
     gWsHandler(ws)
   else:
     echoHandler(ws)
+  subInflight(ws.acc.len)   # whatever the handler left buffered is released
   log(info, ip & " disconnected")
 
 proc unsent(c: Conn; headLen: int; body: string; sent: int): string =
@@ -471,11 +481,13 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
           elif respond(c, c.req, ip):
             # Consume this request's bytes; carry any pipelined leftover.
             dropPrefix(c.acc, need)
+            subInflight(need)
             keepGoing = not shouldClose(c.req)
             # A request that found its bytes already waiting ran without
             # suspending; yield once so a busy connection cannot hold the
             # worker from the others queued on it.
             if keepGoing and not waited: yieldTask()
+  subInflight(c.acc.len)   # bytes never parsed leave the count here
   clearConn(fd)
   closeFd(fd)
 
@@ -491,6 +503,14 @@ proc acceptLoop(listenFd: cint; extraIdx: int) {.passive.} =
         # connreg's deadline table is indexed by fd, so an fd at or past MaxFds
         # cannot be tracked. Refuse it; this caps concurrent connections.
         log(warn, "refusing fd " & $fd.int & " >= MaxFds " & $MaxFds & " (at connection cap)")
+        discard close(fd.cint)
+      elif inflightBytes() >= gServerConfig.maxInflightBytes:
+        # The aggregate cap: per-connection caps bound one connection, this
+        # bounds all of them. Bytes already buffered by live connections
+        # outgrow the budget; new ones are refused, not queued.
+        log(warn, "refusing connection: " & $gServerConfig.maxInflightBytes &
+            " bytes already buffered across connections")
+        discard writeAll(fd.cint, serialize(newResponse(503), closing = true))
         discard close(fd.cint)
       else:
         setNonBlocking(fd.cint)

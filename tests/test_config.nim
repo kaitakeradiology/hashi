@@ -3,6 +3,7 @@
 
 import std/syncio
 import hashi/http/config
+import hashi/http/connreg   # addInflight/subInflight/inflightBytes
 import hashi/http/request
 import hashi/ws/frame
 import hashi/ws/protocol
@@ -17,6 +18,22 @@ block: check d.maxBodySize == MaxBodySize, "default maxBodySize = const"
 block: check d.maxWsPayload == MaxWsPayload, "default maxWsPayload = const"
 block: check d.maxWsMessage == MaxWsMessage, "default maxWsMessage = const"
 block: check d.tcpNoDelay, "nodelay on by default"
+block: check d.idleTimeoutMs > 0, "the idle reaper is armed out of the box"
+block: check d.keepaliveIdleSec > 0 and d.keepaliveIntvlSec > 0 and d.keepaliveCnt > 0,
+      "kernel dead-peer detection on by default"
+block: check d.maxInflightBytes > 0, "aggregate buffered-byte budget on by default"
+
+section "inflight accounting"
+# The accept gate reads one number: bytes buffered across connections and not
+# yet consumed by a parser. Reads add, consumption and teardown subtract.
+block:
+  let base = inflightBytes()
+  addInflight(100)
+  check inflightBytes() == base + 100, "buffered bytes are counted"
+  subInflight(40)
+  check inflightBytes() == base + 60, "consumed bytes stop being counted"
+  subInflight(60)
+  check inflightBytes() == base, "the counter returns to its baseline"
 
 section "setServerConfig"
 block:
