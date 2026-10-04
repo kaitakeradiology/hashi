@@ -172,7 +172,13 @@ proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
     if pr[0] == psIncomplete:
       var n = 0
       if blocking:
+        # Same discipline as the HTTP driver's `waitFill`: arm the idle
+        # deadline for the duration of the wait and disarm the instant the
+        # read returns, so a silent peer is reaped like a silent HTTP one.
+        let w = gServerConfig.idleTimeoutMs
+        if w > 0: setDeadline(ws.fd, getMonoTime().ticks + w.int64 * 1_000_000'i64)
         n = waitRead(ws.fd, addr ws.rbuf[0], ws.rbuf.len)
+        if w > 0: setDeadline(ws.fd, 0'i64)
       else:
         n = cRecv(ws.fd, addr ws.rbuf[0], csize_t(ws.rbuf.len), MsgDontWait)
       if n == 0 or (n < 0 and blocking):
