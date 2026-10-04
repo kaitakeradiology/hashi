@@ -171,6 +171,7 @@ type
     acc: string                 ## inbound bytes not yet consumed
     rbuf: array[4096, byte]     ## the read buffer
     req: Request                ## the request being served
+    bodyPos: int                ## chunked body: bytes of `acc` already decoded
     hb: HeadBuf                 ## each response's head, written in place
 
   HeadOutcome = enum
@@ -221,7 +222,9 @@ proc headNow(c: Conn): HeadOutcome =
     if n <= 0: return hoClosed
     st = parseRequestHead(c.acc, c.req)
   case st
-  of psOk: result = hoOk
+  of psOk:
+    c.bodyPos = c.req.headBytes        # the chunked decode resumes past the head
+    result = hoOk
   of psError: result = hoBad
   of psIncomplete: result = hoTooBig
 
@@ -255,20 +258,23 @@ proc bodyNow(c: Conn; need: var int): BodyOutcome =
     c.req.body = substr(c.acc, c.req.headBytes, need - 1)
     result = boOk
   of bkChunked:
+    # Resume, don't restart: each pass decodes only the chunks the latest
+    # read completed, so a body arriving in N reads costs one pass.
     result = boClosed
+    var pos = c.bodyPos
     var done = false
     while not done:
-      var decoded = ""
-      let cr = decodeChunked(c.acc, c.req.headBytes, decoded, gServerConfig.maxBodySize)
+      let cr = decodeChunked(c.acc, pos, c.req.body, gServerConfig.maxBodySize)
       if cr[0] == psOk:
-        c.req.body = decoded
-        need = c.req.headBytes + cr[1]
+        need = pos + cr[1]
         result = boOk
         done = true
       elif cr[0] == psError:
         result = boBad
         done = true
       else:
+        pos = pos + cr[1]
+        c.bodyPos = pos
         let n = fillNow(c)
         if n == ReadLater:
           result = boMore
