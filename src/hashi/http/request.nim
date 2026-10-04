@@ -626,16 +626,20 @@ proc decodeChunked*(data: string; start: int; body: var string;
   ## Decode a chunked body from `data[start ..]` (RFC 9112 §7.1):
   ##   chunked-body = *chunk last-chunk trailer-section CRLF
   ##   chunk        = chunk-size [chunk-ext] CRLF chunk-data CRLF
-  ## Returns `(psOk, consumed)` with `body` filled and `consumed` the number of
-  ## bytes from `start` through the terminating CRLF; `(psIncomplete, 0)` if
-  ## more bytes are needed; `(psError, 0)` if malformed. chunk-ext and trailer
+  ## Decoded chunk data is appended to `body`, never reset — a driver that
+  ## feeds the body in across several reads resumes at `start + k` with the
+  ## same `body`, so the total work stays linear in the body. Returns
+  ## `(psOk, consumed)` with `consumed` the bytes from `start` through the
+  ## terminating CRLF, or `(psIncomplete, k)` with `k` the bytes consumed up
+  ## to (exclusive) the first chunk it could not complete — calling again
+  ## at `start + k` continues exactly there. `(psError, 0)` if malformed;
+  ## `body` may then hold the prefix decoded so far. chunk-ext and trailer
   ## fields are skipped (not surfaced).
-  body = ""
   var pos = start
   while true:
     let lineEnd = findCrlf(data, pos)
     if lineEnd < 0:
-      return (psIncomplete, 0)
+      return (psIncomplete, pos - start)  # size line not fully here yet
     # chunk-size = 1*HEXDIG, up to ';' (chunk-ext) or CRLF
     var size = 0
     var k = pos
@@ -652,12 +656,13 @@ proc decodeChunked*(data: string; start: int; body: var string;
     if not any:
       return (psError, 0)                 # missing chunk-size
     if size == 0:
-      # last-chunk: consume trailer-section, then the terminating CRLF
+      # last-chunk: report up to its size line so a resume re-parses the
+      # last-chunk and trailer section; the already-decoded body is untouched.
       var tpos = lineEnd + 2
       while true:
         let tEnd = findCrlf(data, tpos)
         if tEnd < 0:
-          return (psIncomplete, 0)
+          return (psIncomplete, pos - start)
         if tEnd == tpos:                  # empty line ends the trailers
           return (psOk, tEnd + 2 - start)
         tpos = tEnd + 2                   # skip a trailer field line
@@ -667,7 +672,7 @@ proc decodeChunked*(data: string; start: int; body: var string;
       let dataStart = lineEnd + 2
       let dataEnd = dataStart + size
       if dataEnd + 2 > data.len:
-        return (psIncomplete, 0)          # need chunk-data + its CRLF
+        return (psIncomplete, pos - start)  # need chunk-data + its CRLF
       if data[dataEnd] != '\r' or data[dataEnd + 1] != '\n':
         return (psError, 0)               # chunk-data not CRLF-terminated
       body.add substr(data, dataStart, dataEnd - 1)

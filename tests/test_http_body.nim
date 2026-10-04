@@ -140,6 +140,66 @@ block:
   check st == psOk, "trailer section consumed"
   check body == "hello", "body unaffected by trailer"
 
+# ── linear decoding: append + resume ─────────────────────────────────────
+# The connection driver feeds a chunked body in as it arrives; re-parsing
+# from byte 0 after every read is O(n^2) in body size. `decodeChunked`
+# appends to `body` instead of resetting it, and on psIncomplete reports
+# how far it consumed, so the driver resumes at `start + k` with the same
+# `body` and the two passes together equal one pass over the whole body.
+section "chunked decode appends and resumes"
+
+block:
+  var body = "pre:"
+  let (st, n) = decodeChunked("5" & CRLF & "hello" & CRLF & "0" & CRLF & CRLF, 0, body)
+  check st == psOk and n == 15, "complete body decodes"
+  check body == "pre:hello", "decoded data appends; body is not reset"
+
+block:
+  # split at a chunk boundary: pass 1 holds one complete chunk and an
+  # incomplete size line; pass 2 resumes at the next chunk line.
+  let full = "5" & CRLF & "hello" & CRLF & "3" & CRLF & "foo" & CRLF & "0" & CRLF & CRLF
+  var body = ""
+  let r1 = decodeChunked(substr(full, 0, 9), 0, body)   # "5\r\nhello\r\n" + "3"
+  check r1[0] == psIncomplete, "first pass stops at the incomplete chunk"
+  check r1[1] == 10, "first pass reports the whole chunk it consumed"
+  check body == "hello", "first pass leaves its decoded bytes in body"
+  let r2 = decodeChunked(full, r1[1], body)
+  check r2[0] == psOk, "resume pass completes the message"
+  check r1[1] + r2[1] == full.len, "resume consumed exactly the rest"
+  check body == "hellofoo", "resume appends the rest"
+
+block:
+  # split inside chunk data: pass 1 consumes nothing yet.
+  let full = "5" & CRLF & "hello" & CRLF & "3" & CRLF & "foo" & CRLF & "0" & CRLF & CRLF
+  var body = ""
+  let r1 = decodeChunked(substr(full, 0, 4), 0, body)   # "5\r\nhe"
+  check r1[0] == psIncomplete and r1[1] == 0, "mid-chunk split consumes nothing"
+  check body == "", "nothing decoded from an incomplete chunk"
+  let r2 = decodeChunked(full, r1[1], body)
+  check r2[0] == psOk and r1[1] + r2[1] == full.len, "resume decodes the whole body"
+  check body == "hellofoo", "the two passes equal one pass"
+
+block:
+  # split after all chunk data: body is already whole, only the last-chunk
+  # line and its empty line are missing; resume re-parses them and adds nothing.
+  let full = "5" & CRLF & "hello" & CRLF & "3" & CRLF & "foo" & CRLF & "0" & CRLF & CRLF
+  var body = ""
+  let r1 = decodeChunked(substr(full, 0, 17), 0, body)  # through "foo\r\n"
+  check r1[0] == psIncomplete and r1[1] == 18, "body complete, terminator absent"
+  check body == "hellofoo", "all chunk data decoded"
+  let r2 = decodeChunked(full, r1[1], body)
+  check r2[0] == psOk and r1[1] + r2[1] == full.len, "terminator completes it"
+  check body == "hellofoo", "terminator adds nothing to body"
+
+block:
+  # the cumulative cap sees bytes decoded on earlier passes
+  let full = "5" & CRLF & "hello" & CRLF & "1" & CRLF & "x" & CRLF & "0" & CRLF & CRLF
+  var body = ""
+  let r1 = decodeChunked(substr(full, 0, 9), 0, body, 64)  # through "hello\r\n"
+  check r1[0] == psIncomplete and body == "hello", "first pass decodes its chunks"
+  let r = decodeChunked(full, 10, body, 5)   # 5 bytes already decoded + 1 > 5
+  check r[0] == psError, "cumulative body over cap rejected across passes"
+
 # ── chunk-size DoS guards (RFC 9112 §7.1, smuggling/DoS §11) ──────────────
 # A chunk-size is 1*HEXDIG with no spec bound, so an unbounded accumulator can
 # (a) buffer arbitrarily much for a size the client never delivers, and

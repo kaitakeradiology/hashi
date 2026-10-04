@@ -66,6 +66,11 @@ block:
       okc = okc + 1
       if not (r[1] > 0 and r[1] <= data.len): bad = bad + 1
       if body.len > cap: bad = bad + 1
+    elif r[0] == psIncomplete:
+      # An incomplete pass reports the bytes it consumed (up to the first
+      # chunk it could not complete), so the driver can resume at `start + k`.
+      if not (r[1] >= 0 and r[1] <= data.len): bad = bad + 1
+      if body.len > cap: bad = bad + 1
     else:
       if r[1] != 0: bad = bad + 1
       if body.len > cap: bad = bad + 1
@@ -94,7 +99,22 @@ block:
     if r[0] != psOk: bad = bad + 1
     elif r[1] != data.len: bad = bad + 1
     elif body != expected: bad = bad + 1
+    # Split-and-resume equals one pass: decode a prefix, then resume at the
+    # reported offset with the same body — the driver's linear decode.
+    let s = rnd(data.len + 1)
+    var b2 = ""
+    let r1 = decodeChunked(substr(data, 0, s - 1), 0, b2, MaxBodySize)
+    if r1[0] == psOk:
+      if r1[1] != data.len or b2 != expected: bad = bad + 1
+    elif r1[0] == psIncomplete:
+      let r2 = decodeChunked(data, r1[1], b2, MaxBodySize)
+      if r2[0] != psOk: bad = bad + 1
+      elif r1[1] + r2[1] != data.len: bad = bad + 1
+      elif b2 != expected: bad = bad + 1
+    else:
+      bad = bad + 1                      # a prefix of valid input never errors
     it = it + 1
   check bad == 0, "all " & $iterations & " chunked bodies round-trip exactly"
+  check bad == 0, "split-and-resume equals one pass on every round-trip input"
 
 finish()
