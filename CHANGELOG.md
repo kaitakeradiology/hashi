@@ -8,6 +8,26 @@ notes.
 
 ## [Unreleased]
 
+### Added
+
+- `maxInflightBytes` (`hashi/http/config`) and the byte count it gates on
+  (`hashi/http/connreg`): the acceptor refuses new connections at an
+  aggregate budget of bytes buffered across all connections.
+- `tests/test_ws_idle.nim`: the idle reaper covers WebSocket reads.
+
+### Changed
+
+- `decodeChunked` appends to `body` and reports its consumed prefix when
+  incomplete; the driver resumes rather than restarts, so a chunked body
+  arriving in N reads costs one pass, not N (was O(n²) in body size).
+- `defaultServerConfig` ships the idle reaper (30 s) and kernel dead-peer
+  detection (60/10/3) on; a WS connection silent at the socket level for
+  longer than `idleTimeoutMs` is now closed by default.
+
+### Security
+
+- Adversarial review and penetration pass; see `doc/security-review.md`.
+
 ## [0.1.5] - 2026-10-01
 
 ### Added
