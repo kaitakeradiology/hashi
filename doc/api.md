@@ -158,9 +158,15 @@ CLOSE) never lands inside a data frame another task is writing: each frame
 is written whole under a per-connection guard. The guard is fair to
 waiting writers, so a control frame waits its turn behind at most the
 frame being written, and once a CLOSE is written no data frame follows
-it. Two tasks sending data still need queued mode, below. A `WsConn` belongs to its handler: once the
-handler returns the driver closes the socket, and nothing may use the
-`WsConn` after that, from any task.
+it. A writer stalled on a peer that stops reading is ended by
+`TCP_USER_TIMEOUT` (`userTimeoutMs`, 60 s by default). With
+`userTimeoutMs` at 0, while the reader's own PING, PONG or CLOSE waits
+behind a stalled writer, the reaper backstop is armed for 5 s past the
+idle timeout after the last inbound byte, so the peer still cannot pin
+the connection. Two tasks sending data still need queued mode,
+below. A `WsConn` belongs to its handler: once the handler returns the
+driver closes the socket, and nothing may use the `WsConn` after that,
+from any task.
 
 **Several tasks, one socket.** A connection written by more than one task
 (a reply handler plus a background stream, say) goes into queued mode:
