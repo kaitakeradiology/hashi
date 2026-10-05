@@ -1,5 +1,5 @@
-## Per-server configuration: size limits, TCP keepalive, the idle reaper and
-## the WebSocket keepalive.
+## Per-server configuration: size limits, TCP keepalive, the idle reaper,
+## the WebSocket keepalive and the lingering close after a rejection.
 ##
 ## Set once via `serve(port, config)` (or `setServerConfig`) before the
 ## reactor starts; the connection driver and the WebSocket session layer read
@@ -62,6 +62,17 @@ type
     wsKeepalivePollMs*: int  ## Longest single keepalive wait, clamped to
                              ## 1..`MaxKeepalivePollMs` (<= 0 means the max).
                              ## Lowered only by tests that measure the timer heap.
+    # Lingering close after a rejection the client may still be sending into
+    # (413, 431, 426, 403, and a claimed upgrade or SSE request with bytes
+    # behind it): the driver half-closes, then reads and discards so the
+    # close is not a reset that loses the response. See `handleConn` in
+    # `hashi/http/server`; `lingeringNow` in `hashi/http/connreg` counts
+    # the connections doing it.
+    lingerMs*: int           ## Longest a rejected connection lingers, in ms;
+                             ## 0 = off: close at once. At most `MaxLingerMs`.
+    lingerIdleMs*: int       ## Stop lingering once the client sends nothing for
+                             ## this long, in ms. Positive and at most `lingerMs`
+                             ## while lingering is on.
 
 const MaxKeepalivePollMs* = 20_000
   ## Upper bound on one keepalive wait. Every wait is a ring poll with a
@@ -71,12 +82,17 @@ const MaxKeepalivePollMs* = 20_000
   ## heap at roughly the poll rate times this, whatever the configured
   ## intervals.
 
+const MaxLingerMs* = 60_000
+  ## Upper bound on `ServerConfig.lingerMs`: a lingering connection holds an
+  ## fd, so its life is capped like any other wait on a client.
+
 proc defaultServerConfig*(): ServerConfig =
   ## The built-in defaults: size limits from each layer's own consts, the
   ## idle reaper and kernel dead-peer detection on (`TCP_USER_TIMEOUT`
   ## 60 s), a 1 GiB aggregate budget for bytes buffered across connections,
   ## and the WebSocket keepalive on: a PING after 20 s of inbound silence,
-  ## CLOSE 1001 after 60 s.
+  ## CLOSE 1001 after 60 s, and a lingering close of up to 5 s (1 s of
+  ## silence ends it) after a rejection.
   result = ServerConfig(maxRequestHead: MaxRequestHead,
                         maxBodySize: MaxBodySize,
                         maxWsPayload: MaxWsPayload,
@@ -91,13 +107,16 @@ proc defaultServerConfig*(): ServerConfig =
                         maxInflightBytes: 1_073_741_824,
                         wsPingIntervalMs: 20_000,
                         wsIdleTimeoutMs: 60_000,
-                        wsKeepalivePollMs: MaxKeepalivePollMs)
+                        wsKeepalivePollMs: MaxKeepalivePollMs,
+                        lingerMs: 5000,
+                        lingerIdleMs: 1000)
 
 proc validateServerConfig*(c: ServerConfig): string =
   ## "" when `c` is usable, else a one-line reason. Refuses a
   ## `maxRequestHead` that is not positive, a negative `wsPingIntervalMs` or
-  ## `wsIdleTimeoutMs`, and a `wsIdleTimeoutMs` under twice
-  ## `wsPingIntervalMs` when both are set.
+  ## `wsIdleTimeoutMs`, a `wsIdleTimeoutMs` under twice `wsPingIntervalMs`
+  ## when both are set, a `lingerMs` outside 0..`MaxLingerMs`, and, while
+  ## `lingerMs` is set, a `lingerIdleMs` that is not positive or exceeds it.
   result = ""
   if c.maxRequestHead <= 0:
     result = "maxRequestHead must be positive (got " & $c.maxRequestHead & ")"
@@ -109,6 +128,13 @@ proc validateServerConfig*(c: ServerConfig): string =
        c.wsIdleTimeoutMs div 2 < c.wsPingIntervalMs:     # idle < 2 * ping, without overflow
     result = "wsIdleTimeoutMs (" & $c.wsIdleTimeoutMs &
              ") must be at least twice wsPingIntervalMs (" & $c.wsPingIntervalMs & ")"
+  elif c.lingerMs < 0 or c.lingerMs > MaxLingerMs:
+    result = "lingerMs must be between 0 and " & $MaxLingerMs & " (got " & $c.lingerMs & ")"
+  elif c.lingerMs > 0 and c.lingerIdleMs <= 0:
+    result = "lingerIdleMs must be positive while lingerMs is set (got " & $c.lingerIdleMs & ")"
+  elif c.lingerMs > 0 and c.lingerIdleMs > c.lingerMs:
+    result = "lingerIdleMs (" & $c.lingerIdleMs & ") must not exceed lingerMs (" &
+             $c.lingerMs & ")"
 
 var gServerConfig* = defaultServerConfig()
   ## The active config. Set before `serve`; read-only during serving.

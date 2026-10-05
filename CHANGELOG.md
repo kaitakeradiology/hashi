@@ -25,6 +25,11 @@ notes.
   with a deadline.
 - `validateServerConfig` (`hashi/http/config`); `serve` logs the reason and
   exits 1 on a config it rejects.
+- `lingerMs` (default 5 s, 0 = off) and `lingerIdleMs` (default 1 s)
+  (`hashi/http/config`): the lingering close after a rejection.
+  `lingeringNow`, `lingerClosedTotal`, `lingerCap` and `setLingerCap`
+  (`hashi/http/connreg`) report and bound it; `shutdownWrite`,
+  `hasPendingInput` and `openFileLimit` (`hashi/net`).
 
 ### Changed
 
@@ -55,6 +60,10 @@ notes.
 - Responses the server sends just before closing the connection (400, 403,
   413, 426, 431, and a middleware claim on a WebSocket upgrade or SSE
   request) carry `Connection: close` (RFC 9112 §9.6).
+- A 413, 431, 426 or 403, or a middleware claim on an upgrade or SSE
+  request with bytes behind it, sent to a client still sending, could be
+  lost to a reset: the driver closed with the client's bytes unread. It now
+  half-closes and drains for up to `lingerMs` first.
 
 ### Security
 

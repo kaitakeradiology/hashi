@@ -11,6 +11,10 @@
 ## registered with `setSseHandler`; both pass the pre-dispatch middleware
 ## first.
 ##
+## A rejection the client may still be sending into ends in a lingering
+## close rather than an immediate one, so the response is not lost to a
+## reset: see `handleConn` and `ServerConfig.lingerMs`.
+##
 ## Handlers resume on the reactor's worker pool, so several run at once on
 ## different threads. State local to a handler is safe; state shared between
 ## handlers needs a lock.
@@ -174,6 +178,7 @@ type
     req: Request                ## the request being served
     bodyPos: int                ## chunked body: bytes of `acc` already decoded
     hb: HeadBuf                 ## each response's head, written in place
+    linger: bool                ## end with a lingering close (see `handleConn`)
 
   HeadOutcome = enum
     hoOk        ## `c.req` holds a complete head
@@ -211,10 +216,23 @@ proc waitFill(c: Conn): int {.passive.} =
     addInflight(result)
     appendBytes(c.acc, addr c.rbuf[0], result)
 
+proc lingersAfter(status: int): bool =
+  ## The rejections a client may still be sending into: a body or head over
+  ## its cap, a request on a WebSocket-only listener, a refused origin.
+  status == 413 or status == 431 or status == 426 or status == 403
+
 proc reject(c: Conn; status: int) {.passive.} =
   ## Answer `status` with an empty body and `Connection: close`; the caller
-  ## ends the connection.
-  discard writeAll(c.fd, serialize(newResponse(status), closing = true))
+  ## ends the connection. Once the whole response is written, a 413, 431,
+  ## 426 or 403 marks the connection to linger; a 400 does not, since the
+  ## client's framing is already in doubt.
+  if writeAll(c.fd, serialize(newResponse(status), closing = true)) and lingersAfter(status):
+    c.linger = true
+
+proc sentMore(c: Conn; consumed: int): bool =
+  ## Whether the client sent more than the `consumed` bytes of its request:
+  ## they are buffered, or waiting on the socket.
+  c.acc.len > consumed or hasPendingInput(c.fd)
 
 proc headNow(c: Conn): HeadOutcome =
   ## Parse a request head into `c.req` from what `c.acc` holds and what has
@@ -357,7 +375,11 @@ proc upgradeToWs(c: Conn; req: Request; ip: string; extraIdx: int) {.passive.} =
     let sc = runBefore(appRouter, req)
     if sc.isSome:
       let resp = runAfter(appRouter, req, sc.get(default(Response)))
-      discard writeAll(c.fd, serialize(resp, req.httpMethod, closing = true))
+      # A claim lingers only when the client sent more than the upgrade
+      # request: frames written ahead of the 101 they expected.
+      if writeAll(c.fd, serialize(resp, req.httpMethod, closing = true)) and
+         sentMore(c, req.headBytes):
+        c.linger = true
       accessLog(ip, resp.status, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
       return
   if not writeAll(c.fd, handshakeResponse(req)): return
@@ -426,21 +448,71 @@ proc respond(c: Conn; req: Request; ip: string): bool {.passive.} =
   if result:
     accessLog(ip, resp.status, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
 
-proc serveSse(c: Conn; req: Request; ip: string) {.passive.} =
+proc serveSse(c: Conn; req: Request; ip: string; need: int) {.passive.} =
   ## Hand a matching request to the SSE handler. The pre-dispatch middleware
   ## still runs, so the endpoint is gated like any route; a claim is a
-  ## rejection, sent with `Connection: close`. Otherwise the handler
-  ## owns the fd until it returns.
+  ## rejection, sent with `Connection: close`, which lingers when the client
+  ## sent more than the request's `need` bytes. Otherwise the handler owns
+  ## the fd until it returns.
   let t0 = getMonoTime()
   let sc = runBefore(appRouter, req)
   if sc.isSome:
     let resp = runAfter(appRouter, req, sc.get(default(Response)))
-    discard writeAll(c.fd, serialize(resp, req.httpMethod, closing = true))
+    if writeAll(c.fd, serialize(resp, req.httpMethod, closing = true)) and
+       sentMore(c, need):
+      c.linger = true
     accessLog(ip, resp.status, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
   else:
     # Logged as 200 at handoff: a stream has no single end status.
     accessLog(ip, 200, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
     gSseHandler(req, c.fd)
+
+const LingerReadBudget = 65536
+  ## Most bytes a lingering connection discards per wake before it polls
+  ## again, so a flooding client yields its worker between batches.
+
+proc discardNow(c: Conn): bool =
+  ## Read and drop what has arrived, up to `LingerReadBudget` bytes. True to
+  ## keep lingering: some bytes came and the socket ran dry, or the budget
+  ## ran out. False at EOF, on an error, or when the wake found nothing, so
+  ## a readiness that yields no bytes cannot spin.
+  result = true
+  var got = 0
+  var going = true
+  while going:
+    let n = readNow(c.fd, addr c.rbuf[0], c.rbuf.len)
+    if n > 0:
+      got = got + n
+      if got >= LingerReadBudget: going = false
+    elif n == ReadLater:
+      if got == 0: result = false
+      going = false
+    else:
+      result = false
+      going = false
+
+proc lingerWaitMs(t0: MonoTime): int =
+  ## The next readiness wait of a linger begun at `t0`: the idle bound,
+  ## clipped to what is left of `lingerMs` and to at least 1 ms; 0 once
+  ## `lingerMs` has passed.
+  let remaining = gServerConfig.lingerMs - int((getMonoTime() - t0).inMilliseconds)
+  result = if remaining <= 0: 0 else: max(1, min(gServerConfig.lingerIdleMs, remaining))
+
+proc drainLinger(c: Conn) {.passive.} =
+  ## Read and discard what the client still sends, until it closes, errors,
+  ## goes `lingerIdleMs` without sending, or `lingerMs` has passed since the
+  ## start. Bounded by time only, not by bytes. The bytes are never counted
+  ## in flight: they are not buffered past the read.
+  let t0 = getMonoTime()
+  var going = true
+  while going:
+    let ms = lingerWaitMs(t0)
+    if ms <= 0:
+      going = false
+    elif waitReadableUntil(c.fd, ms) < 0:
+      going = false      # timed out (idle, or lingerMs is up) or the wait failed
+    else:
+      going = discardNow(c)
 
 proc handleConn(fd: cint; extraIdx: int) {.passive.} =
   ## The keep-alive connection driver; see the module doc for the request
@@ -448,6 +520,15 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
   ## WebSocket-only listener the connection arrived on, where only an
   ## upgrade is served and anything else gets 426. Every path ends at the
   ## close at the bottom.
+  ##
+  ## A connection marked to linger (see `reject`, `upgradeToWs` and
+  ## `serveSse`) closes gracefully when `lingerMs` is set and a slot is free
+  ## under `lingerCap`: its buffers are released, the write side is shut
+  ## down so the client reads the response and then EOF, and what the client
+  ## still sends is discarded until it closes, goes `lingerIdleMs` silent or
+  ## `lingerMs` passes. Closing at once instead, with unread bytes in the
+  ## receive queue, makes the kernel send a reset that can destroy the
+  ## response before the client reads it. Any other end closes at once.
   let c = Conn(fd: fd, peer: peerAddress(fd), acc: "", req: default(Request))
   # Only a trusted proxy's forwarded headers change the client address, so
   # for any other peer it is settled here rather than per request.
@@ -488,7 +569,7 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
         of boOk:
           c.req.startNanos = getMonoTime().ticks
           if hasSseHandler() and sseMatches(c.req):
-            serveSse(c, c.req, ip)
+            serveSse(c, c.req, ip, need)
           elif respond(c, c.req, ip):
             # Consume this request's bytes; carry any pipelined leftover.
             dropPrefix(c.acc, need)
@@ -499,6 +580,13 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
             # worker from the others queued on it.
             if keepGoing and not waited: yieldTask()
   subInflight(c.acc.len)   # bytes never parsed leave the count here
+  when defined(posix):
+    if c.linger and gServerConfig.lingerMs > 0 and tryEnterLinger():
+      c.acc = ""
+      clear(c.req)
+      shutdownWrite(fd)
+      drainLinger(c)
+      leaveLinger()
   clearConn(fd)
   closeFd(fd)
 
@@ -571,6 +659,8 @@ proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
     log(LogLevel.error, "hashi http: invalid server config — " & bad)
     quit(1)
   setServerConfig(config)
+  let nofile = openFileLimit()
+  setLingerCap((if nofile > 0: min(MaxFds, nofile) else: MaxFds) div 4)
   ignoreSigpipe()
   initLoop()
   let listenFd = listenOrQuit(port, bindAddr, "")
