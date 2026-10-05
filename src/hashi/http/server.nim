@@ -25,6 +25,7 @@ import hashi/http/router
 import hashi/http/httplog
 import hashi/http/forwarded
 import hashi/ws/handshake
+from hashi/ws/protocol import assembledLen
 import hashi/ws/session
 import hashi/ws/session_io
 import hashi/sse/session
@@ -371,7 +372,9 @@ proc upgradeToWs(c: Conn; req: Request; ip: string; extraIdx: int) {.passive.} =
     gWsHandler(ws)
   else:
     echoHandler(ws)
-  subInflight(ws.acc.len)   # whatever the handler left buffered is released
+  # Whatever the handler left buffered is released: unparsed frames and a
+  # message part-way assembled.
+  subInflight(ws.acc.len + assembledLen(ws.st))
   log(info, ip & " disconnected")
 
 proc unsent(c: Conn; headLen: int; body: string; sent: int): string =

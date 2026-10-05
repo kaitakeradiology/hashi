@@ -158,6 +158,14 @@ proc wsConsume(ws: WsConn; consumed: int) =
   dropPrefix(ws.acc, consumed)
   subInflight(consumed)
 
+proc countAssembled(ws: WsConn; before: int) =
+  ## Move the in-flight count with the message being assembled, whose
+  ## length was `before` ahead of the last `handleFrame`: a fragment added
+  ## to it is counted, and a message delivered or dropped stops being.
+  let after = assembledLen(ws.st)
+  if after > before: addInflight(after - before)
+  elif after < before: subInflight(before - after)
+
 proc fillSendBuf(ws: WsConn; op: Opcode; data: string): int =
   ## Non-passive: build [frame header | payload] into the connection's reusable
   ## send buffer (one heap buffer, grown to the largest frame seen, reused after).
@@ -438,7 +446,9 @@ proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
       # big inbound buffer first. Only `handleFrame`'s returned action is read
       # after this; `f` itself is not touched again.
       wsConsume(ws, pr[1])
+      let before = assembledLen(ws.st)
       let act = handleFrame(ws.st, f, gServerConfig.maxWsMessage)
+      countAssembled(ws, before)
       if act.kind == waPong:
         if not readerEmit(ws, serializeFrame(opPong, act.payload), lnUrgent, true):
           ws.open = false

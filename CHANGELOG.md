@@ -42,6 +42,8 @@ notes.
   inside a data frame another task is part-way through writing, nor waits
   indefinitely behind one; once a CLOSE has been written, data frames are
   refused (`wsSend`/`wsWriteAll` return false).
+- The `maxInflightBytes` count includes a fragmented WebSocket message while
+  it is assembled (`assembledLen`, `hashi/ws/protocol`).
 
 ### Security
 
