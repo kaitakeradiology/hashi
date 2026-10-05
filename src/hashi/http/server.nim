@@ -212,8 +212,9 @@ proc waitFill(c: Conn): int {.passive.} =
     appendBytes(c.acc, addr c.rbuf[0], result)
 
 proc reject(c: Conn; status: int) {.passive.} =
-  ## Answer `status` with an empty body; the caller ends the connection.
-  discard writeAll(c.fd, serialize(newResponse(status)))
+  ## Answer `status` with an empty body and `Connection: close`; the caller
+  ## ends the connection.
+  discard writeAll(c.fd, serialize(newResponse(status), closing = true))
 
 proc headNow(c: Conn): HeadOutcome =
   ## Parse a request head into `c.req` from what `c.acc` holds and what has
@@ -340,11 +341,11 @@ proc dispatchAsync(req: Request): Response {.passive.} =
 proc upgradeToWs(c: Conn; req: Request; ip: string; extraIdx: int) {.passive.} =
   ## The WebSocket upgrade for a request `isWebSocketUpgrade` accepted:
   ## refuse a cross-site origin with 403; on the main listener (`extraIdx`
-  ## -1) run the pre-dispatch middleware, whose claim is sent as an ordinary
-  ## response in place of the upgrade; else answer 101 and hand the socket
-  ## to the handler, the main one or secondary listener `extraIdx`'s, which
-  ## skips the middleware. Returns once the handler returns or the upgrade
-  ## is refused; the caller closes the fd.
+  ## -1) run the pre-dispatch middleware, whose claim is sent with
+  ## `Connection: close` in place of the upgrade; else answer 101 and hand
+  ## the socket to the handler, the main one or secondary listener
+  ## `extraIdx`'s, which skips the middleware. Returns once the handler
+  ## returns or the upgrade is refused; the caller closes the fd.
   let t0 = getMonoTime()
   let wsOrigin = header(req, "Origin")
   if not (originAllowed(wsOrigin) or originMatchesHost(wsOrigin, header(req, "Host"))):
@@ -356,7 +357,7 @@ proc upgradeToWs(c: Conn; req: Request; ip: string; extraIdx: int) {.passive.} =
     let sc = runBefore(appRouter, req)
     if sc.isSome:
       let resp = runAfter(appRouter, req, sc.get(default(Response)))
-      discard writeAll(c.fd, serialize(resp, req.httpMethod))
+      discard writeAll(c.fd, serialize(resp, req.httpMethod, closing = true))
       accessLog(ip, resp.status, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
       return
   if not writeAll(c.fd, handshakeResponse(req)): return
@@ -428,13 +429,13 @@ proc respond(c: Conn; req: Request; ip: string): bool {.passive.} =
 proc serveSse(c: Conn; req: Request; ip: string) {.passive.} =
   ## Hand a matching request to the SSE handler. The pre-dispatch middleware
   ## still runs, so the endpoint is gated like any route; a claim is a
-  ## rejection and is sent as an ordinary response. Otherwise the handler
+  ## rejection, sent with `Connection: close`. Otherwise the handler
   ## owns the fd until it returns.
   let t0 = getMonoTime()
   let sc = runBefore(appRouter, req)
   if sc.isSome:
     let resp = runAfter(appRouter, req, sc.get(default(Response)))
-    discard writeAll(c.fd, serialize(resp, req.httpMethod))
+    discard writeAll(c.fd, serialize(resp, req.httpMethod, closing = true))
     accessLog(ip, resp.status, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
   else:
     # Logged as 200 at handoff: a stream has no single end status.

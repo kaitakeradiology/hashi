@@ -47,11 +47,14 @@ notes.
 
 ### Fixed
 
-- `maxRequestHead` is a hard cap: a complete request head longer than it,
-  through its CRLFCRLF, is answered 431. Only an incomplete head was
-  checked before, so a complete one up to about 4 KiB past the cap was
-  served, WebSocket upgrades included. `validateServerConfig` refuses a
-  `maxRequestHead` that is not positive.
+- `maxRequestHead` limits the request line and header section exactly: a
+  complete one longer than the limit, through the blank line that ends it,
+  is answered 431. Only an incomplete header section was checked before,
+  so one up to about 4 KiB over the limit was served, WebSocket upgrades
+  included. `validateServerConfig` refuses a limit of 0 or less.
+- Responses the server sends just before closing the connection (400, 403,
+  413, 426, 431, and a middleware claim on a WebSocket upgrade or SSE
+  request) carry `Connection: close` (RFC 9112 §9.6).
 
 ### Security
 
