@@ -12,7 +12,8 @@ notes.
 
 - `maxInflightBytes` (`hashi/http/config`) and the byte count it gates on
   (`hashi/http/connreg`): the acceptor refuses new connections at an
-  aggregate budget of bytes buffered across all connections.
+  aggregate budget of bytes buffered across all connections; 0 is no
+  budget, and a negative value is refused by `validateServerConfig`.
 - WebSocket keepalive: a `wsRecv` parked on a quiet peer sends a PING
   every `wsPingIntervalMs` (default 20 s) of inbound silence and, after
   `wsIdleTimeoutMs` (default 60 s), CLOSE 1001 and returns `wmClose`.
