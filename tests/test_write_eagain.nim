@@ -28,7 +28,14 @@
 ## The socket-mode scenario asks the server's accepted socket for its
 ## `O_NONBLOCK` flag: set on both backends. The pipe scenario runs
 ## `readNow`, `writeNow` and `writevNow` on a non-socket fd.
-import std/[syncio, strutils]
+##
+## The contention scenarios make the ring complete an op with -EAGAIN
+## without any half-close: two reads parked on one pipe are both woken by
+## one byte, and the one that loses the race finds nothing; two writes
+## parked on a full pipe are both woken by one page of room, and the loser
+## finds none. `waitRead` and `waitWrite` must each return the byte count
+## from the next wake, never the -EAGAIN.
+import std/[syncio, strutils, atomics]
 from std/posix/posix import Sockaddr_in, SockLen
 import hashi
 import hashi/buffer
@@ -374,8 +381,123 @@ proc pipeScenario() =
   discard cClose(fds[0])
   check writeNow(fds[0], "x", 0) == -1, "a closed fd writes -1"
 
+const ReadRaceSettleMs = 100   ## for both parked ops to be in the kernel
+const RaceJoinMs = 5000        ## most time a contention scenario waits to join
+
+var gRaceRes: array[2, int]    ## accessed atomically: each task's wait result
+var gRaceByte: array[2, int]   ## accessed atomically: the byte each read got
+var gRaceDone: int             ## accessed atomically: tasks finished
+
+proc setNonBlock(fd: cint) =
+  discard cFcntl(fd, FSetfl, cFcntl(fd, FGetfl, 0.cint) or ONonblock)
+
+proc awaitRace() {.passive.} =
+  ## Wait for both tasks of a contention scenario, up to `RaceJoinMs`.
+  var waited = 0
+  while atomicLoad(gRaceDone) < 2 and waited < RaceJoinMs:
+    sleepMs(50)
+    waited = waited + 50
+
+proc pipeReader(fd: cint; i: int) {.passive.} =
+  var b = 0'u8
+  let n = waitRead(fd, addr b, 1)
+  atomicStore(gRaceByte[i], int(b))
+  atomicStore(gRaceRes[i], n)
+  discard atomicFetchAdd(gRaceDone, 1)
+
+proc readRaceScenario() {.passive.} =
+  section "two reads parked on one pipe"
+  var fds = default(array[2, cint])
+  check cPipe(addr fds[0]) == 0, "pipe"
+  setNonBlock(fds[0])
+  setNonBlock(fds[1])
+  atomicStore(gRaceDone, 0)
+  atomicStore(gRaceRes[0], -99)
+  atomicStore(gRaceRes[1], -99)
+  spawnTask pipeReader(fds[0], 0)
+  spawnTask pipeReader(fds[0], 1)
+  sleepMs(ReadRaceSettleMs)
+  check writeNow(fds[1], "a", 0) == 1, "the first byte is written"
+  sleepMs(ReadRaceSettleMs)   # one read took it; the other was woken for nothing
+  check atomicLoad(gRaceDone) == 1, "one read returned on the first byte"
+  check writeNow(fds[1], "b", 0) == 1, "the second byte is written"
+  awaitRace()
+  let r0 = atomicLoad(gRaceRes[0])
+  let r1 = atomicLoad(gRaceRes[1])
+  check atomicLoad(gRaceDone) == 2, "both reads returned"
+  check r0 == 1 and r1 == 1,
+        "each read returned one byte, never -EAGAIN (" & $r0 & ", " & $r1 & ")"
+  let b0 = atomicLoad(gRaceByte[0])
+  let b1 = atomicLoad(gRaceByte[1])
+  check (b0 == int('a') and b1 == int('b')) or (b0 == int('b') and b1 == int('a')),
+        "the reads got one byte each (" & $b0 & ", " & $b1 & ")"
+  closeFd(fds[0])
+  closeFd(fds[1])
+
+const RaceChunk = 4096   ## at most `PIPE_BUF`: a pipe takes it whole or not at all
+
+proc pipeWriter(fd: cint; i: int) {.passive.} =
+  var buf {.noinit.}: array[RaceChunk, char]
+  var k = 0
+  while k < RaceChunk:
+    buf[k] = 'w'
+    k = k + 1
+  let n = waitWrite(fd, addr buf[0], RaceChunk)
+  atomicStore(gRaceRes[i], n)
+  discard atomicFetchAdd(gRaceDone, 1)
+
+proc drainPipe(fd: cint): int =
+  ## Read and count what the pipe holds, up to `n` bytes per read.
+  result = 0
+  var buf {.noinit.}: array[RaceChunk, byte]
+  var going = true
+  while going:
+    let n = readNow(fd, addr buf[0], buf.len)
+    if n > 0: result = result + n
+    else: going = false
+
+proc writeRaceScenario() {.passive.} =
+  section "two writes parked on a full pipe"
+  var fds = default(array[2, cint])
+  check cPipe(addr fds[0]) == 0, "pipe"
+  setNonBlock(fds[0])
+  setNonBlock(fds[1])
+  # Fill the pipe to its capacity, whatever that is here.
+  let filler = filled(1 shl 20, 'f')
+  let filledBytes = writeNow(fds[1], filler, 0)
+  check filledBytes > 0 and filledBytes < filler.len, "the pipe is full at " & $filledBytes & " bytes"
+  check writeNow(fds[1], "x", 0) == 0, "a full pipe takes nothing"
+  atomicStore(gRaceDone, 0)
+  atomicStore(gRaceRes[0], -99)
+  atomicStore(gRaceRes[1], -99)
+  let before = writeRetriesTotal()
+  spawnTask pipeWriter(fds[1], 0)
+  spawnTask pipeWriter(fds[1], 1)
+  sleepMs(ReadRaceSettleMs)
+  check atomicLoad(gRaceDone) == 0, "both writes are parked on the full pipe"
+  var buf {.noinit.}: array[RaceChunk, byte]
+  var got = readNow(fds[0], addr buf[0], buf.len)   # one page of room: one write fits
+  check got == RaceChunk, "read one page from the pipe"
+  sleepMs(ReadRaceSettleMs)   # one write took the room; the other was woken for nothing
+  check atomicLoad(gRaceDone) == 1, "one write returned on the first page of room"
+  got = got + readNow(fds[0], addr buf[0], buf.len)  # room for the other
+  awaitRace()
+  let r0 = atomicLoad(gRaceRes[0])
+  let r1 = atomicLoad(gRaceRes[1])
+  check atomicLoad(gRaceDone) == 2, "both writes returned"
+  check r0 == RaceChunk and r1 == RaceChunk,
+        "each write returned its " & $RaceChunk & " bytes, never -EAGAIN (" & $r0 & ", " & $r1 & ")"
+  got = got + drainPipe(fds[0])
+  check got == filledBytes + 2 * RaceChunk,
+        "the pipe delivered " & $got & " of " & $(filledBytes + 2 * RaceChunk) & " bytes"
+  echo "  write retries: ", writeRetriesTotal() - before
+  closeFd(fds[0])
+  closeFd(fds[1])
+
 proc runAll() {.passive.} =
   pipeScenario()
+  readRaceScenario()
+  writeRaceScenario()
   modeScenario()
   httpScenario("a 32 MiB response to a client that half-closed", true)
   stallScenario()
