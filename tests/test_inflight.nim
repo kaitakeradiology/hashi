@@ -222,6 +222,11 @@ proc statusOf(resp: string): int =
       if d >= '0' and d <= '9': result = result * 10 + (ord(d) - ord('0'))
       i = i + 1
 
+proc closesConn(resp: string): bool =
+  ## Whether the first response's header section carries `Connection: close`.
+  let e = find(resp, "\r\n\r\n")
+  result = e >= 0 and find(substr(resp, 0, e + 1), "\r\nConnection: close\r\n") >= 0
+
 proc countOf(hay, needle: string): int =
   result = 0
   var at = find(hay, needle)
@@ -286,6 +291,8 @@ proc answered(what, request: string; status: int) {.passive.} =
   send(c, request)
   finishClient(c)
   check statusOf(c.acc) == status, "answered " & $status & " (got " & $statusOf(c.acc) & ")"
+  if status >= 400:
+    check closesConn(c.acc), "the rejection says Connection: close"
   check inflightBytes() == start, countMsg("after EOF", inflightBytes(), start)
 
 proc headSplitOverCap() {.passive.} =
@@ -303,6 +310,7 @@ proc headSplitOverCap() {.passive.} =
   send(c, substr(head, first, head.len - 1))
   finishClient(c)
   check statusOf(c.acc) == 431, "answered 431 (got " & $statusOf(c.acc) & ")"
+  check closesConn(c.acc), "the rejection says Connection: close"
   check inflightBytes() == start, countMsg("after EOF", inflightBytes(), start)
 
 proc pipelinedUnderCap() {.passive.} =
@@ -338,6 +346,7 @@ proc upgradeRefused(what, request: string; status: int) {.passive.} =
   send(c, request)
   finishClient(c)
   check statusOf(c.acc) == status, "answered " & $status & " (got " & $statusOf(c.acc) & ")"
+  check closesConn(c.acc), "the refusal says Connection: close"
   check inflightBytes() == start, countMsg("after EOF", inflightBytes(), start)
 
 proc openWs(c: Client): bool {.passive.} =
