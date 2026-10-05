@@ -39,7 +39,6 @@ const
   TCP_USER_TIMEOUT = 18.cint
   SHUT_WR = 1.cint
   MSG_PEEK = 2.cint
-  MSG_DONTWAIT = 0x40.cint
   RLIMIT_NOFILE = 7.cint
   INET6_ADDRSTRLEN = 46
 
@@ -61,6 +60,16 @@ proc signal(signum: cint; handler: pointer): pointer {.
 proc shutdownSocket(fd, how: cint): cint {.importc: "shutdown", header: "<sys/socket.h>".}
 proc recv(fd: cint; buf: pointer; len: csize_t; flags: cint): int {.
   importc, header: "<sys/socket.h>".}
+
+when defined(linux):
+  const MsgDontWait* = 0x40.cint    ## `MSG_DONTWAIT`: this one call does not block.
+  const MsgNoSignal* = 0x4000.cint  ## `MSG_NOSIGNAL`: no SIGPIPE for this one send.
+elif defined(macosx):
+  const MsgDontWait* = 0x80.cint
+  const MsgNoSignal* = 0.cint       ## None here: a send to a reset peer can raise SIGPIPE.
+else:
+  const MsgDontWait* = 0x80.cint
+  const MsgNoSignal* = 0x20000.cint
 
 type
   RLimit {.importc: "struct rlimit", header: "<sys/resource.h>".} = object
@@ -232,11 +241,40 @@ proc shutdownWrite*(fd: cint) =
   ## still deliver what the peer sends.
   discard shutdownSocket(fd, SHUT_WR)
 
+proc sockRecv*(fd: cint; buf: pointer; len: int; flags: cint): int {.inline.} =
+  ## `recv(2)`: the bytes received, or -1 with `errno` set. With `MsgDontWait`
+  ## the call does not block whatever the fd's own mode.
+  recv(fd, buf, csize_t(len), flags)
+
+proc sockSend*(fd: cint; buf: pointer; len: int; flags: cint): int {.
+  importc: "send", header: "<sys/socket.h>".}
+  ## `send(2)`: the bytes taken, or -1 with `errno` set (`ENOTSOCK` when `fd`
+  ## is not a socket). With `MsgDontWait` the call does not block whatever
+  ## the fd's own mode.
+
+type
+  MsgHdr {.importc: "struct msghdr", header: "<sys/socket.h>".} = object
+    ## The C struct itself: only the gather fields are named, and the rest
+    ## stay zero.
+    msg_iov: nil pointer
+    msg_iovlen: int
+
+proc sendmsg(fd: cint; msg: ptr MsgHdr; flags: cint): int {.
+  importc, header: "<sys/socket.h>".}
+
+proc sockSendv*(fd: cint; iov: pointer; cnt: int; flags: cint): int =
+  ## `sendmsg(2)` of the `cnt` `struct iovec`s at `iov`, with the result
+  ## contract of `sockSend`.
+  var msg = default(MsgHdr)
+  msg.msg_iov = iov
+  msg.msg_iovlen = cnt
+  sendmsg(fd, addr msg, flags)
+
 proc hasPendingInput*(fd: cint): bool =
   ## Whether the peer has sent bytes that are waiting to be read, checked
   ## without blocking and without taking them. False at EOF and on an error.
   var b = 0'u8
-  result = recv(fd, addr b, csize_t(1), MSG_PEEK or MSG_DONTWAIT) > 0
+  result = recv(fd, addr b, csize_t(1), MSG_PEEK or MsgDontWait) > 0
 
 proc openFileLimit*(): int =
   ## The soft `RLIMIT_NOFILE`: how many fds this process may hold open, or

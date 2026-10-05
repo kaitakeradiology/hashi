@@ -22,6 +22,7 @@ import std/threadpool
 export threadpool
 import std/ioring
 export ioring
+import std/atomics
 
 when (defined(release) or defined(danger)) and not defined(windows):
   # A release build of a hashi program is optimised across modules: the
@@ -31,7 +32,8 @@ when (defined(release) or defined(danger)) and not defined(windows):
   {.passL: "-flto".}
 
 when defined(posix):
-  from std/posix/posix import read, write, pcall, EAGAIN, EINTR, IOVec
+  from std/posix/posix import read, write, pcall, EAGAIN, EINTR, ENOTSOCK, IOVec
+  import hashi/net
   proc cWritev(fd: cint; iov: pointer; iovcnt: cint): int {.importc: "writev".}
     ## `iov` points at `IOVec`s, which have `struct iovec`'s layout.
   proc usleepMicroseconds(usec: cuint): cint {.importc: "usleep", header: "<unistd.h>".}
@@ -98,20 +100,6 @@ proc waitAccept*(listenFd: cint): int {.passive.} =
   discard submitAccept(listenFd, never, c, addr result)
   suspend()
 
-proc waitRead*(fd: cint; buf: pointer; len: int): int {.passive.} =
-  ## Suspend until the read completes; returns bytes read (0 = peer closed).
-  result = -1
-  let c = delay()
-  discard submitRead(fd, buf, len, never, c, addr result)
-  suspend()
-
-proc waitWrite*(fd: cint; buf: pointer; len: int): int {.passive.} =
-  ## Suspend until the write completes; returns bytes written.
-  result = -1
-  let c = delay()
-  discard submitWrite(fd, buf, len, never, c, addr result)
-  suspend()
-
 proc waitReadableUntil*(fd: cint; ms: int): int {.passive.} =
   ## Suspend until `fd` is readable or `ms` milliseconds pass, whichever is
   ## first; `ms < 0` waits with no deadline. Returns `IoTimedOut` when the
@@ -129,40 +117,163 @@ proc waitReadableUntil*(fd: cint; ms: int): int {.passive.} =
   discard submitPollAdd(fd, deadline, {evRead}, c, addr result)
   suspend()
 
+const
+  RetryFirstMs = 1      ## the first back-off after a wake without readiness
+  RetryCapMs = 1000     ## the back-off doubles up to this
+
+when defined(posix):
+  const
+    RingAgain = -int(EAGAIN)
+    RingIntr = -int(EINTR)
+else:
+  const
+    RingAgain = low(int)
+    RingIntr = low(int)
+
+var gWriteRetries: int64   ## accessed atomically; see `writeRetriesTotal`
+
+proc writeRetriesTotal*(): int64 =
+  ## Cumulative writes `waitWrite` had to retry because the ring completed
+  ## them with `EAGAIN`, for tests and telemetry.
+  atomicLoad(gWriteRetries)
+
+proc readOnce(fd: cint; buf: pointer; len: int): int {.passive.} =
+  result = -1
+  let c = delay()
+  discard submitRead(fd, buf, len, never, c, addr result)
+  suspend()
+
+proc writeOnce(fd: cint; buf: pointer; len: int): int {.passive.} =
+  result = -1
+  let c = delay()
+  discard submitWrite(fd, buf, len, never, c, addr result)
+  suspend()
+
+proc waitWritable(fd: cint): int {.passive.} =
+  ## Suspend until `fd` is writable or the poll wakes for another reason (a
+  ## half-close of the peer); returns the `toIoEvents` mask that fired, or a
+  ## negative error.
+  result = -1
+  let c = delay()
+  discard submitPollAdd(fd, never, {evWrite}, c, addr result)
+  suspend()
+
+proc waitRead*(fd: cint; buf: pointer; len: int): int {.passive.} =
+  ## Suspend until the read completes; returns bytes read (0 = peer closed)
+  ## or a negative error; never `-EAGAIN`. An `EAGAIN` from the ring waits for
+  ## readability and tries again. On io_uring a poll can wake on the peer's
+  ## half-close without readiness; such a wake backs off, doubling up to 1 s,
+  ## rather than retrying at once.
+  result = readOnce(fd, buf, len)
+  var pause = RetryFirstMs
+  var retried = false
+  var again = (result == RingAgain or result == RingIntr)
+  while again:
+    let p = waitReadableUntil(fd, -1)
+    if p < 0:
+      result = p
+      again = false
+    else:
+      if evRead in toIoEvents(p) and not retried:
+        retried = true                # ready: one immediate retry per call
+      else:
+        sleepMs(pause)
+        pause = if pause * 2 > RetryCapMs: RetryCapMs else: pause * 2
+      result = readOnce(fd, buf, len)
+      again = (result == RingAgain or result == RingIntr)
+
+proc waitWrite*(fd: cint; buf: pointer; len: int): int {.passive.} =
+  ## Suspend until the write completes; returns bytes written or a negative
+  ## error; never `-EAGAIN`. On a full send buffer the ring can complete the
+  ## write with `EAGAIN`, after the peer's FIN too; that waits for writability
+  ## and tries again. On io_uring a poll can wake on the peer's half-close
+  ## without writability; such a wake backs off, doubling up to 1 s, rather
+  ## than retrying at once, so a stalled peer costs one attempt a second. A
+  ## wake that does report writability retries at once, but only once per
+  ## call, so a poll that reports writable while the write still finds no
+  ## room backs off too.
+  result = writeOnce(fd, buf, len)
+  var pause = RetryFirstMs
+  var retried = false
+  var again = (result == RingAgain or result == RingIntr)
+  while again:
+    discard atomicFetchAdd(gWriteRetries, 1'i64)
+    let p = waitWritable(fd)
+    if p < 0:
+      result = p
+      again = false
+    else:
+      if evWrite in toIoEvents(p) and not retried:
+        retried = true                # ready: one immediate retry per call
+      else:
+        sleepMs(pause)
+        pause = if pause * 2 > RetryCapMs: RetryCapMs else: pause * 2
+      result = writeOnce(fd, buf, len)
+      again = (result == RingAgain or result == RingIntr)
+
 const ReadLater* = -2
   ## `readNow`'s answer when nothing has arrived yet.
 
+when defined(posix):
+  const NotNow = -clong(EAGAIN)
+
+  proc recvOnce(fd: cint; buf: pointer; len: int): clong =
+    ## One read that does not block whatever `fd`'s mode: `recv` with
+    ## `MSG_DONTWAIT`, or plain `read` for a non-socket `fd` (a pipe, a PTY),
+    ## which is then non-blocking only if it was opened so. `-errno` on failure.
+    result = pcall(sockRecv(fd, buf, len, MsgDontWait))
+    if result == -clong(ENOTSOCK):
+      result = pcall(read(fd, buf, len))
+
+  proc sendOnce(fd: cint; buf: pointer; len: int): clong =
+    ## `recvOnce` for a write: `send` with `MSG_DONTWAIT` and `MSG_NOSIGNAL`,
+    ## or plain `write` for a non-socket `fd`.
+    result = pcall(sockSend(fd, buf, len, MsgDontWait or MsgNoSignal))
+    if result == -clong(ENOTSOCK):
+      result = pcall(write(fd, buf, len))
+
+  proc sendvOnce(fd: cint; iov: ptr IOVec; cnt: int): clong =
+    ## `sendOnce` for a gather write: `sendmsg`, or plain `writev`.
+    result = pcall(sockSendv(fd, iov, cnt, MsgDontWait or MsgNoSignal))
+    if result == -clong(ENOTSOCK):
+      result = pcall(cWritev(fd, iov, cint(cnt)))
+
 proc readNow*(fd: cint; buf: pointer; len: int): int =
-  ## Read what has already arrived on the non-blocking `fd` into `buf`, up to
-  ## `len` bytes, without waiting. Returns the bytes read, 0 when the peer
-  ## has closed, -1 on an error, or `ReadLater` when nothing is there yet.
-  ## Where there is no direct read (Windows) it always returns `ReadLater`.
+  ## Read what has already arrived on `fd` into `buf`, up to `len` bytes,
+  ## without waiting: the call itself is non-blocking (`MSG_DONTWAIT`)
+  ## whatever the socket's mode. A non-socket `fd` is read with plain
+  ## `read`, so it must be non-blocking itself. Returns the bytes read, 0
+  ## when the peer has closed, -1 on an error, or `ReadLater` when nothing is
+  ## there yet. Where there is no direct read (Windows) it always returns
+  ## `ReadLater`.
   result = ReadLater
   when defined(posix):
     var done = false
     while not done:
-      let n = pcall(read(fd, buf, len))
+      let n = recvOnce(fd, buf, len)
       if n >= 0:
         result = int(n)
         done = true
-      elif n == -clong(EAGAIN): done = true
+      elif n == NotNow: done = true
       elif n != -clong(EINTR):
         result = -1
         done = true
 
 proc writeNow*(fd: cint; data: string; off: int): int =
-  ## Write as much of `data[off ..]` to the non-blocking `fd` as the kernel
-  ## takes without waiting. Returns the bytes written, 0 when it took none
-  ## (a full socket buffer), or -1 on an error such as a closed peer. Where
-  ## there is no direct write (Windows), it writes nothing and returns 0.
+  ## Write as much of `data[off ..]` to `fd` as the kernel takes without
+  ## waiting: the call itself is non-blocking (`MSG_DONTWAIT`) whatever the
+  ## socket's mode. A non-socket `fd` is written with plain `write`, so it
+  ## must be non-blocking itself. Returns the bytes written, 0 when it took
+  ## none (a full socket buffer), or -1 on an error such as a closed peer.
+  ## Where there is no direct write (Windows), it writes nothing and returns 0.
   result = 0
   when defined(posix):
     var done = false
     while not done and off + result < data.len:
-      let n = pcall(write(fd, readRawData(data, off + result), data.len - off - result))
+      let n = sendOnce(fd, readRawData(data, off + result), data.len - off - result)
       if n > 0: result = result + int(n)
       elif n == -clong(EINTR): discard
-      elif n == -clong(EAGAIN) or n == 0: done = true
+      elif n == NotNow or n == 0: done = true
       else:
         result = -1
         done = true
@@ -188,10 +299,10 @@ proc writevNow*(fd: cint; head: pointer; headLen: int; body: string): int =
         iov[cnt] = IOVec(iov_base: readRawData(body, bodyOff),
                          iov_len: csize_t(body.len - bodyOff))
         cnt = cnt + 1
-      let n = pcall(cWritev(fd, addr iov[0], cint(cnt)))
+      let n = sendvOnce(fd, addr iov[0], cnt)
       if n > 0: result = result + int(n)
       elif n == -clong(EINTR): discard
-      elif n == -clong(EAGAIN) or n == 0: done = true
+      elif n == NotNow or n == 0: done = true
       else:
         result = -1
         done = true
