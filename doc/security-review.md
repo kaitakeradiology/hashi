@@ -11,9 +11,13 @@ The parser core held. Everything the probes threw at the head parser was
 either accepted in canonical form or answered 400/413/431: CL+TE and
 duplicate-CL/TE smuggling shapes, non-token field names, LF-only folds,
 absolute- and asterisk-form targets, percent-encoding edges (`%2F`, `%00`,
-dot segments, double encoding), oversized heads and bodies, unmasked WS
-frames (1002), cross-site `Origin` upgrades (403), and pipelined carry-over
-on one connection. What did not hold was all resource-shaped, below.
+dot segments, double encoding), oversized bodies, unterminated oversized
+heads, unmasked WS frames (1002), cross-site `Origin` upgrades (403), and
+pipelined carry-over on one connection. One cap gap: `maxRequestHead` was
+checked only while a head was incomplete, so a complete head of up to about
+4 KiB (one read) past the cap was served. Fixed: a complete head longer than
+`maxRequestHead`, through its CRLFCRLF, is now 431 too, WebSocket upgrades
+included (`tests/test_inflight.nim`). What did not hold was all resource-shaped, below.
 
 ## Findings
 
@@ -65,10 +69,13 @@ on by default (60 s). `tests/test_ws_idle.nim` and
 
 ### 4. 431/413 rejections can arrive as a reset, not the response — kept
 
-On a too-large head the driver stops reading and closes with the client's
-tail still in the kernel receive buffer, so `close` becomes RST and the
-status line is lost if the client had not finished sending. Cosmetic (the
-connection dies either way, the status is for the logs); left as is.
+On any 431 or 413 the driver writes the status and closes without draining
+what the client is still sending. If bytes remain unread in the kernel
+receive buffer at `close`, or arrive after it, the kernel answers with RST
+and the client may lose the status line. That covers an unterminated head
+over `maxRequestHead`, a complete head over it followed by a body or by
+pipelined requests, and a Content-Length over `maxBodySize`. Cosmetic: the
+connection ends either way, and the status is for the logs. Left as is.
 
 ### 5. Notes, no action
 

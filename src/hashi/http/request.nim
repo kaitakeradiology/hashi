@@ -87,9 +87,10 @@ type
 
 const MaxRequestHead* = 64 * 1024
   ## Largest accepted request head (request-line + field block, up to and
-  ## including the terminating CRLFCRLF). The connection driver rejects a
-  ## connection that buffers more than this without completing a head — a
-  ## slowloris / header-flood guard (driver replies 431, then closes).
+  ## including the terminating CRLFCRLF). The connection driver answers 431
+  ## and closes when it buffers this many bytes without completing a head, or
+  ## when a complete head is longer than this — a header-flood guard. The
+  ## default for `ServerConfig.maxRequestHead`, which the driver enforces.
 
 const MaxBodySize* = 64 * 1024 * 1024
   ## Largest accepted request body — for Content-Length *and* the assembled

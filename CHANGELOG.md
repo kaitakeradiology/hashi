@@ -45,6 +45,14 @@ notes.
 - The `maxInflightBytes` count includes a fragmented WebSocket message while
   it is assembled (`assembledLen`, `hashi/ws/protocol`).
 
+### Fixed
+
+- `maxRequestHead` is a hard cap: a complete request head longer than it,
+  through its CRLFCRLF, is answered 431. Only an incomplete head was
+  checked before, so a complete one up to about 4 KiB past the cap was
+  served, WebSocket upgrades included. `validateServerConfig` refuses a
+  `maxRequestHead` that is not positive.
+
 ### Security
 
 - Adversarial review and penetration pass; see `doc/security-review.md`.

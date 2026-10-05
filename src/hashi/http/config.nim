@@ -18,7 +18,11 @@ import hashi/ws/protocol
 type
   ServerConfig* = object
     ## Limits and socket options applied by `serve`. See `defaultServerConfig`.
-    maxRequestHead*: int   ## Max request-head bytes; exceeded → 431.
+    maxRequestHead*: int   ## Max request-head bytes, through the terminating
+                           ## CRLFCRLF; exceeded → 431. A malformed head is 400
+                           ## when its CRLFCRLF arrives by the read that crosses
+                           ## the cap; past that the driver stops reading and
+                           ## answers 431. Must be positive.
     maxBodySize*: int      ## Max request body (Content-Length and chunked); exceeded → 413/400.
     maxWsPayload*: int     ## Max single WebSocket frame payload; exceeded → protocol error.
     maxWsMessage*: int     ## Max assembled (fragmented) WebSocket message; exceeded → close 1009.
@@ -90,11 +94,14 @@ proc defaultServerConfig*(): ServerConfig =
                         wsKeepalivePollMs: MaxKeepalivePollMs)
 
 proc validateServerConfig*(c: ServerConfig): string =
-  ## "" when `c` is usable, else a one-line reason. Refuses a negative
-  ## `wsPingIntervalMs` or `wsIdleTimeoutMs`, and a `wsIdleTimeoutMs` under
-  ## twice `wsPingIntervalMs` when both are set.
+  ## "" when `c` is usable, else a one-line reason. Refuses a
+  ## `maxRequestHead` that is not positive, a negative `wsPingIntervalMs` or
+  ## `wsIdleTimeoutMs`, and a `wsIdleTimeoutMs` under twice
+  ## `wsPingIntervalMs` when both are set.
   result = ""
-  if c.wsPingIntervalMs < 0:
+  if c.maxRequestHead <= 0:
+    result = "maxRequestHead must be positive (got " & $c.maxRequestHead & ")"
+  elif c.wsPingIntervalMs < 0:
     result = "wsPingIntervalMs must not be negative (got " & $c.wsPingIntervalMs & ")"
   elif c.wsIdleTimeoutMs < 0:
     result = "wsIdleTimeoutMs must not be negative (got " & $c.wsIdleTimeoutMs & ")"
