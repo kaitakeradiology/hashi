@@ -53,6 +53,29 @@ parameter cannot do is escape: a call handed to the scheduler with `delay`
 or `spawnTask` can outlive the caller's frame, so it must not take one.
 The compiler rejects that; pass an owned value (`sink`) instead.
 
+### Socket mode
+
+Connection sockets are `O_NONBLOCK` on every backend: `serve` sets it on each
+accepted socket. A blocking socket is not an option on io_uring, where a
+write to a peer that has half-closed and does not read is handed to a kernel
+worker thread that waits as long as the peer does, one thread per stalled
+client.
+
+On a non-blocking socket the ring can complete a write (or read) with
+`-EAGAIN`, after the peer's FIN too. `waitWrite` and `waitRead` never return
+it: they wait for readiness and retry. On io_uring that poll can wake on the
+peer's half-close without readiness; such a wake backs off, doubling from 1 ms
+up to 1 s, rather than retrying at once, so a stalled peer costs one write
+attempt a second and a peer that resumes reading gets its data within a
+second. `writeRetriesTotal` counts the retried writes.
+
+hashi's own direct calls (`readNow`, `writeNow`, `writevNow`, the WebSocket
+reader, `hasPendingInput`) use `MSG_DONTWAIT`, so they do not depend on the
+socket's mode. On a non-socket fd (a pipe, a PTY master) `readNow`,
+`writeNow` and `writevNow` fall back to plain `read`/`write`/`writev`, which
+need the fd to be `O_NONBLOCK` itself. A handler that owns its own fds should
+make them `O_NONBLOCK` and pass them to `waitRead`/`waitWrite`.
+
 ## HTTP
 
 `serve(port)` starts the loop and blocks. Register everything before

@@ -52,6 +52,15 @@ notes.
 
 ### Fixed
 
+- A large response to a client that half-closed its end (shutdown of its
+  write side) was cut short on io_uring: the ring completed the write with
+  `-EAGAIN` on the `O_NONBLOCK` socket, which was taken for a vanished peer,
+  so a 32 MiB body arrived as 3 to 8 MB followed by a clean EOF. `waitWrite`
+  and `waitRead` now wait for readiness and retry on `EAGAIN`, backing off
+  (1 ms doubling to 1 s) when the poll wakes on the half-close without
+  readiness, so a stalled peer costs one attempt a second. `readNow`,
+  `writeNow` and `writevNow` are non-blocking per call (`MSG_DONTWAIT`)
+  instead of per socket.
 - `maxRequestHead` limits the request line and header section exactly: a
   complete one longer than the limit, through the blank line that ends it,
   is answered 431. Only an incomplete header section was checked before,
