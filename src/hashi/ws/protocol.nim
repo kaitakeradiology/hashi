@@ -109,6 +109,11 @@ proc handleClose(f: Frame): WsAction =
     return closeAction(1007)
   result = closeAction(1000)
 
+proc assembledLen*(st: WsState): int =
+  ## Payload bytes of the fragmented message being assembled; 0 between
+  ## messages.
+  result = st.buf.len
+
 proc handleFrame*(st: var WsState; f: Frame; maxMessage = MaxWsMessage): WsAction =
   ## Advance the protocol state with one parsed frame, returning the action.
   if not f.masked:

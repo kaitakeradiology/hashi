@@ -18,7 +18,12 @@
 ## every read adds (`addInflight`), every consumed or dropped byte subtracts
 ## (`subInflight`), and the acceptor refuses new connections at
 ## `ServerConfig.maxInflightBytes` so many part-buffered requests cannot
-## outgrow the machine.
+## outgrow the machine. It covers the bytes a connection holds unparsed (an
+## HTTP connection's read buffer, a WebSocket's inbound frame buffer) and
+## the payload of a fragmented WebSocket message while it is assembled, up
+## to `maxWsMessage` per connection, until the message is delivered,
+## refused or the connection ends. Transient copies made while those bytes
+## are still counted (a request body, a delivered message) are not.
 ##
 ## Writes are intentionally not timed. A write blocks under TCP flow control
 ## until the peer's window reopens, which for a slow-but-alive reader can be
@@ -61,7 +66,8 @@ proc subInflight*(n: int) =
 
 proc inflightBytes*(): int64 =
   ## Total bytes buffered across all connections and not yet consumed by a
-  ## parser. The per-connection caps bound one connection; this bounds all
+  ## parser, plus fragmented WebSocket messages being assembled. The
+  ## per-connection caps bound one connection; this bounds all
   ## of them at once, and the acceptor refuses new connections at
   ## `ServerConfig.maxInflightBytes`.
   atomicLoad(gInflight)
