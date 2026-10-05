@@ -37,6 +37,20 @@ block:
   check validateServerConfig(c) == "", "keepalive off (0/0) is valid"
 block:
   var c = defaultServerConfig()
+  c.maxRequestHead = 0
+  check validateServerConfig(c) == "maxRequestHead must be positive (got 0)",
+        "a zero head cap is refused"
+block:
+  var c = defaultServerConfig()
+  c.maxRequestHead = -1
+  check validateServerConfig(c) == "maxRequestHead must be positive (got -1)",
+        "a negative head cap is refused"
+block:
+  var c = defaultServerConfig()
+  c.maxRequestHead = 1
+  check validateServerConfig(c) == "", "a head cap of one byte is valid"
+block:
+  var c = defaultServerConfig()
   c.wsPingIntervalMs = -1
   check validateServerConfig(c) == "wsPingIntervalMs must not be negative (got -1)",
         "a negative ping interval is refused"

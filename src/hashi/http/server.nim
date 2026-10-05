@@ -178,7 +178,7 @@ type
   HeadOutcome = enum
     hoOk        ## `c.req` holds a complete head
     hoClosed    ## the peer went away
-    hoTooBig    ## no head within `maxRequestHead` bytes
+    hoTooBig    ## the head, through its CRLFCRLF, exceeds `maxRequestHead` bytes
     hoBad       ## malformed
     hoMore      ## incomplete, and nothing more has arrived yet
 
@@ -218,24 +218,31 @@ proc reject(c: Conn; status: int) {.passive.} =
 proc headNow(c: Conn): HeadOutcome =
   ## Parse a request head into `c.req` from what `c.acc` holds and what has
   ## already arrived; `hoMore` when the head is incomplete and the socket is
-  ## empty.
+  ## empty. `hoTooBig` when the head, through its CRLFCRLF, is longer than
+  ## `maxRequestHead`: `c.acc` reaches the cap without one, or a complete
+  ## head ends past it.
   clear(c.req)
+  let cap = gServerConfig.maxRequestHead
   var st = parseRequestHead(c.acc, c.req)
-  while st == psIncomplete and c.acc.len <= gServerConfig.maxRequestHead:
+  while st == psIncomplete and c.acc.len < cap:
     let n = fillNow(c)
     if n == ReadLater: return hoMore
     if n <= 0: return hoClosed
     st = parseRequestHead(c.acc, c.req)
   case st
   of psOk:
-    c.bodyPos = c.req.headBytes        # the chunked decode resumes past the head
-    result = hoOk
+    if c.req.headBytes > cap:
+      result = hoTooBig
+    else:
+      c.bodyPos = c.req.headBytes      # the chunked decode resumes past the head
+      result = hoOk
   of psError: result = hoBad
   of psIncomplete: result = hoTooBig
 
 proc awaitHead(c: Conn): HeadOutcome {.passive.} =
   ## `headNow`, waiting on the ring while the head is incomplete: a full head
-  ## in `c.req`, or the peer closed, or no head within `maxRequestHead`.
+  ## of at most `maxRequestHead` bytes in `c.req`, or the peer closed, or
+  ## `hoTooBig`.
   result = headNow(c)
   while result == hoMore:
     if waitFill(c) <= 0: return hoClosed

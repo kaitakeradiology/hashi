@@ -201,6 +201,17 @@ proc filled(n: int; c: char): string =
     result[i] = c
     i = i + 1
 
+proc sizedHead(lines: string; total: int): string =
+  ## A request head of exactly `total` bytes, terminating CRLFCRLF included:
+  ## `lines` (a request line and field lines, each ending in CRLF), then an
+  ## `X-Fill` field padding it out, then the blank line.
+  const Name = "X-Fill: "
+  result = lines & Name & filled(total - lines.len - Name.len - 4, 'f') & "\r\n\r\n"
+
+proc getHead(total: int): string =
+  ## A `GET /ok` head of exactly `total` bytes.
+  result = sizedHead("GET /ok HTTP/1.1\r\nHost: localhost\r\n", total)
+
 proc statusOf(resp: string): int =
   ## The status code of the first response in `resp`, or 0.
   result = 0
@@ -268,13 +279,40 @@ proc chunkedInPieces() {.passive.} =
   check statusOf(c.acc) == 200 and endsWith(c.acc, "hello world"), "echoed the body"
   check inflightBytes() == start, countMsg("after EOF", inflightBytes(), start)
 
-proc rejected(what, request: string; status: int) {.passive.} =
+proc answered(what, request: string; status: int) {.passive.} =
   section what
   let start = inflightBytes()
   let c = newClient()
   send(c, request)
   finishClient(c)
   check statusOf(c.acc) == status, "answered " & $status & " (got " & $statusOf(c.acc) & ")"
+  check inflightBytes() == start, countMsg("after EOF", inflightBytes(), start)
+
+proc headSplitOverCap() {.passive.} =
+  section "a complete head over maxRequestHead, split across reads: 431"
+  # The first write stays under the cap, so the driver reads on; the second
+  # completes the head well past it. The second write waits until the
+  # server has buffered the first, so the head arrives as two reads.
+  let start = inflightBytes()
+  let c = newClient()
+  let head = getHead(MaxHead + 4038)
+  let first = MaxHead - 8
+  send(c, substr(head, 0, first - 1))
+  let mid = settle(start + int64(first))
+  check mid == start + int64(first), countMsg("first part buffered", mid, start + int64(first))
+  send(c, substr(head, first, head.len - 1))
+  finishClient(c)
+  check statusOf(c.acc) == 431, "answered 431 (got " & $statusOf(c.acc) & ")"
+  check inflightBytes() == start, countMsg("after EOF", inflightBytes(), start)
+
+proc pipelinedUnderCap() {.passive.} =
+  section "a pipelined pair, each head under maxRequestHead, together over it"
+  let start = inflightBytes()
+  let c = newClient()
+  let head = getHead(MaxHead - 548)
+  send(c, head & head)
+  finishClient(c)
+  check countOf(c.acc, "HTTP/1.1 200") == 2, "both answered 200"
   check inflightBytes() == start, countMsg("after EOF", inflightBytes(), start)
 
 proc upgradeThenClose() {.passive.} =
@@ -374,20 +412,36 @@ proc runAll() {.passive.} =
   plainRequest()
   pipelinedPair()
   chunkedInPieces()
-  rejected("a malformed request: 400",
+  answered("a malformed request: 400",
            "GET /ok HTTP/1.1\r\nHost: localhost\r\nno colon here\r\n\r\ntrailing bytes", 400)
-  rejected("a body over maxBodySize: 413",
+  answered("a body over maxBodySize: 413",
            "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5000\r\n\r\n" &
            filled(100, 'x'), 413)
-  # Unterminated: the driver answers 431 once it holds more than
-  # `maxRequestHead` bytes with no end of head in them.
-  rejected("a head over maxRequestHead: 431",
+  # Unterminated: the driver answers 431 once it holds `maxRequestHead`
+  # bytes with no end of head in them.
+  answered("an unterminated head over maxRequestHead: 431",
            "GET /ok HTTP/1.1\r\nHost: localhost\r\nX-Big: " & filled(MaxHead + 200, 'h'), 431)
+  # Exactly `maxRequestHead` bytes and no end of head: already over the cap,
+  # so 431 without waiting for more. A driver that read on would see only
+  # the client's EOF and close without an answer.
+  const unterminated = "GET /ok HTTP/1.1\r\nHost: localhost\r\nX-Big: "
+  answered("an unterminated head of exactly maxRequestHead: 431",
+           unterminated & filled(MaxHead - unterminated.len, 'h'), 431)
+  # Terminated: the cap counts the head through its CRLFCRLF.
+  answered("a head of exactly maxRequestHead: 200", getHead(MaxHead), 200)
+  answered("a head one byte over maxRequestHead: 431", getHead(MaxHead + 1), 431)
+  answered("a complete head over maxRequestHead in one read: 431",
+           getHead(MaxHead + 1998), 431)
+  headSplitOverCap()
+  pipelinedUnderCap()
   upgradeThenClose()
   upgradeRefused("a cross-site upgrade: origin 403",
                  upgradeRequest("/ws", "http://evil.example"), 403)
   upgradeRefused("an upgrade claimed by before-middleware",
                  upgradeRequest("/deny"), 401)
+  let up = upgradeRequest("/ws")
+  upgradeRefused("an upgrade head over maxRequestHead: 431, not 101",
+                 sizedHead(substr(up, 0, up.len - 3), MaxHead + 1998), 431)
   fragmentedMessage()
   fragmentAbandoned()
   fragmentTooBig()
