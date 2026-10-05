@@ -29,6 +29,7 @@ import hashi/http/connreg
 import hashi/net             # openFileLimit
 import hashi/http/request    # ParseStatus
 import hashi/ws/frame
+import hashi/sse/session    # setSseHandler
 import testkit
 
 proc cClose(fd: cint): cint {.importc: "close", header: "<unistd.h>".}
@@ -88,13 +89,14 @@ proc freePort(): uint16 =
     discard cClose(fd)
 
 var gPort = 0'u16
+var gWsPort = 0'u16   ## the WebSocket-only listener
 
-proc dial(): cint =
-  ## A non-blocking client socket connected to the server. Loopback connects
+proc dial(port: uint16): cint =
+  ## A non-blocking client socket connected to the server on `port`. Loopback connects
   ## complete in the kernel's backlog, so the blocking connect cannot stall.
   result = cSocket(AfInet, SockStream, IpprotoTcp)
   if result >= 0:
-    var a = loopbackAddr(gPort)
+    var a = loopbackAddr(port)
     if cConnect(result, addr a, SockLen(sizeof(a))) != 0:
       discard cClose(result)
       result = -1
@@ -118,8 +120,10 @@ proc noFrame(): Frame =
   ## What `readFrame` answers when the server closed first.
   result = Frame(fin: true, opcode: opClose, masked: false, payload: "")
 
-proc newClient(): Client =
-  result = Client(fd: dial(), acc: "", eof: false, endErr: 0, sendErr: 0,
+proc newClient(port = 0'u16): Client =
+  ## A client on `port`, the main listener's when 0.
+  let p = if port == 0'u16: gPort else: port
+  result = Client(fd: dial(p), acc: "", eof: false, endErr: 0, sendErr: 0,
                   frame: noFrame())
 
 proc readSome(c: Client): bool {.passive.} =
@@ -752,6 +756,28 @@ proc lingeringRefusals() {.passive.} =
         "the claim lingered: the client had sent more than the request"
   settled("after the refusals", start, lstart)
 
+proc lingeringGates() {.passive.} =
+  section "linger: a 426 on the WebSocket-only listener and a claimed SSE request with bytes behind it"
+  let start = inflightBytes()
+  let lstart = lingeringNow()
+  var closed0 = lingerClosedTotal()
+  let u = newClient(gWsPort)
+  sendAll(u, "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n" & filled(32768, 'x'))
+  let head = readHead(u)
+  readToEof(u)
+  u.acc = head & u.acc
+  completeReject(u, 426)
+  discard cClose(u.fd)
+  check lingerEnded(closed0, getMonoTime(), 3000) >= 0, "the 426 lingered"
+  closed0 = lingerClosedTotal()
+  let s = newClient()
+  send(s, "GET /deny-sse HTTP/1.1\r\nHost: localhost\r\n\r\nbytes behind the request")
+  finishClient(s)
+  check statusOf(s.acc) == 401 and s.endErr == 0, "the claimed SSE request answered 401, then EOF"
+  check lingerEnded(closed0, getMonoTime(), 3000) >= 0,
+        "the SSE claim lingered: the client had sent more than the request"
+  settled("after the gated ends", start, lstart)
+
 proc noLinger() {.passive.} =
   section "no linger after a response, a 400, a WebSocket session or a bare claim"
   let start = inflightBytes()
@@ -827,6 +853,7 @@ proc runAll() {.passive.} =
   lingerCapHolds()
   lingerEqualsIdle()
   lingeringRefusals()
+  lingeringGates()
   noLinger()
   finish()
 
@@ -838,6 +865,17 @@ proc ok(req: Request): Response {.nimcall, raises.} =
 proc echoBody(req: Request): Response {.nimcall, raises.} =
   newResponse(200, req.body)
 
+proc wsOnly(ws: WsConn) {.passive.} =
+  ## The WebSocket-only listener's handler; no scenario upgrades on it.
+  discard wsRecv(ws)
+
+proc isSse(req: Request): bool {.nimcall.} =
+  ## The SSE endpoint, behind `denyGate`, so its stream handler never runs.
+  path(req) == "/deny-sse"
+
+proc sseNever(req: Request; fd: cint) {.passive.} =
+  discard
+
 proc denyGate(req: Request): Opt[Response] {.nimcall.} =
   ## Claims `/deny…`, which the upgrade scenario uses; passes the rest.
   if startsWith(path(req), "/deny"): result = some(newResponse(401))
@@ -845,8 +883,9 @@ proc denyGate(req: Request): Opt[Response] {.nimcall.} =
 
 discard cAlarm(90)
 gPort = freePort()
-if gPort == 0'u16:
-  writeLine(stderr, "test_inflight: no free loopback port")
+gWsPort = freePort()
+if gPort == 0'u16 or gWsPort == 0'u16 or gPort == gWsPort:
+  writeLine(stderr, "test_inflight: no free loopback ports")
   quit(1)
 var cfg = defaultServerConfig()
 cfg.maxBodySize = MaxBody
@@ -857,5 +896,9 @@ cfg.lingerIdleMs = LingerIdleMs
 get("/ok", ok)
 post("/echo", echoBody)
 addBeforeMiddleware(denyGate)
+setSseHandler(isSse, sseNever)
+if not addWsListener(gWsPort, wsOnly, bindAddr = "127.0.0.1"):
+  writeLine(stderr, "test_inflight: no WebSocket-only listener")
+  quit(1)
 setBootTask(runAll)
 serve(gPort, cfg, bindAddr = "127.0.0.1")
