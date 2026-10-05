@@ -14,11 +14,19 @@
 ## assembled: after its first fragment the count stands at the payload
 ## buffered so far, and it drops back once the message is delivered, refused
 ## or abandoned.
-import std/[syncio, strutils, opt]
+##
+## A rejection the client may still be sending into (413, 431, the origin
+## 403, a claimed upgrade with bytes behind it) is followed by a lingering
+## close: the client reads the whole response and then EOF, never a reset.
+## The linger scenarios watch `lingeringNow` and `lingerClosedTotal` to time
+## how long the server lingers against a trickling, a silent and a flooding
+## client, and that the cap on lingering connections holds.
+import std/[syncio, strutils, opt, monotimes, times, atomics]
 from std/posix/posix import Sockaddr_in, SockLen
 import hashi
 import hashi/buffer
 import hashi/http/connreg
+import hashi/net             # openFileLimit
 import hashi/http/request    # ParseStatus
 import hashi/ws/frame
 import testkit
@@ -34,6 +42,10 @@ proc cShutdown(fd: cint; how: cint): cint {.importc: "shutdown", header: "<sys/s
 proc cHtons(x: uint16): uint16 {.importc: "htons", header: "<arpa/inet.h>".}
 proc cNtohs(x: uint16): uint16 {.importc: "ntohs", header: "<arpa/inet.h>".}
 proc cHtonl(x: uint32): uint32 {.importc: "htonl", header: "<arpa/inet.h>".}
+proc cWrite(fd: cint; buf: pointer; n: csize_t): int {.importc: "write", header: "<unistd.h>".}
+var cErrno {.importc: "errno", header: "<errno.h>".}: cint
+const EAGAIN = 11.cint
+const EINTR = 4.cint
 proc cAlarm(seconds: cuint): cuint {.importc: "alarm", header: "<unistd.h>".}
   ## The watchdog: a scenario that never sees its EOF fails the run instead
   ## of hanging it.
@@ -49,6 +61,10 @@ const Loopback = 0x7F000001'u32
 const MaxBody = 1024        ## `maxBodySize` for the run: the 413 scenario's cap
 const MaxHead = 2048        ## `maxRequestHead`: the 431 scenario's cap
 const MaxMessage = 4096     ## `maxWsMessage`: the 1009 scenario's cap
+const LingerMs = 600        ## `lingerMs`: the longest a rejected connection lingers
+const LingerIdleMs = 200    ## `lingerIdleMs`: the longest it waits on a silent client
+const Slack = 250           ## timing tolerance on a loaded machine, in ms
+const ECONNRESET = 104
 
 # ── sockets ─────────────────────────────────────────────────────────────
 
@@ -91,26 +107,31 @@ proc dial(): cint =
 type Client = ref object
   fd: cint
   acc: string                ## bytes read and not yet taken
-  eof: bool                  ## the server closed its end
+  eof: bool                  ## the server closed its end, or the read failed
+  endErr: int                ## the read that set `eof`: 0 for EOF, else -errno
+  sendErr: int               ## the first failed `sendAll` write's -errno, else 0
   frame: Frame               ## the frame `nextFrame` last took
   rbuf: array[4096, byte]
+  wbuf: array[4096, byte]
 
 proc noFrame(): Frame =
   ## What `readFrame` answers when the server closed first.
   result = Frame(fin: true, opcode: opClose, masked: false, payload: "")
 
 proc newClient(): Client =
-  result = Client(fd: dial(), acc: "", eof: false, frame: noFrame())
+  result = Client(fd: dial(), acc: "", eof: false, endErr: 0, sendErr: 0,
+                  frame: noFrame())
 
 proc readSome(c: Client): bool {.passive.} =
   ## One read into `c.acc`; false once the server has closed or the read
-  ## failed.
+  ## failed, with the read's result in `c.endErr`.
   let n = waitRead(c.fd, addr c.rbuf[0], c.rbuf.len)
   if n > 0:
     appendBytes(c.acc, addr c.rbuf[0], n)
     result = true
   else:
     c.eof = true
+    c.endErr = n
     result = false
 
 proc readToEof(c: Client) {.passive.} =
@@ -149,6 +170,29 @@ proc readFrame(c: Client): Frame {.passive.} =
 
 proc send(c: Client; s: string) {.passive.} =
   discard writeAll(c.fd, s)
+
+proc writeOnce(c: Client; s: string; off: int): int =
+  ## One write(2) of `s[off ..]`: the bytes taken, 0 when the socket buffer
+  ## is full, or -errno.
+  let n = min(s.len - off, c.wbuf.len)
+  copyOut(addr c.wbuf[0], s, off, n)
+  let r = cWrite(c.fd, addr c.wbuf[0], csize_t(n))
+  result = if r >= 0: int(r)
+           elif cErrno == EAGAIN or cErrno == EINTR: 0
+           else: -int(cErrno)
+
+proc sendAll(c: Client; s: string) {.passive.} =
+  ## Write all of `s` with plain write(2), keeping the first failure's -errno
+  ## in `c.sendErr`. The kernel reports a reset once, to whichever call meets
+  ## it first, so a write can take the ECONNRESET a later read would
+  ## otherwise see. Not through the ring: a write parked there for buffer
+  ## space can surface the reset as EPIPE instead.
+  var off = 0
+  while off < s.len and c.sendErr == 0:
+    let r = writeOnce(c, s, off)
+    if r < 0: c.sendErr = r
+    elif r == 0: sleepMs(1)
+    else: off = off + r
 
 proc finishClient(c: Client) {.passive.} =
   ## Half-close our end, read until the server closes its own, then close.
@@ -417,6 +461,326 @@ proc fragmentProtocolError() {.passive.} =
   finishClient(c)
   check inflightBytes() == start, countMsg("after EOF", inflightBytes(), start)
 
+# ── the lingering close ─────────────────────────────────────────────────
+
+proc msSince(t0: MonoTime): int =
+  int((getMonoTime() - t0).inMilliseconds)
+
+proc settleLinger(want: int64): int64 {.passive.} =
+  ## `lingeringNow()` once it equals `want`, or its value after 3 s.
+  result = lingeringNow()
+  var waited = 0
+  while result != want and waited < 3000:
+    sleepMs(5)
+    waited = waited + 5
+    result = lingeringNow()
+
+proc lingerEnded(before: int64; t0: MonoTime; limitMs: int): int {.passive.} =
+  ## Milliseconds from `t0` until `lingerClosedTotal()` passes `before`, or
+  ## -1 when it does not within `limitMs`.
+  result = -1
+  while result < 0 and msSince(t0) < limitMs:
+    if lingerClosedTotal() > before: result = msSince(t0)
+    else: sleepMs(5)
+
+proc tooBig(bodyLen: int): string =
+  ## A POST head declaring a `bodyLen`-byte body.
+  "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: " & $bodyLen & "\r\n\r\n"
+
+proc settled(what: string; start, lstart: int64) {.passive.} =
+  ## The counts are back where the scenario found them.
+  check inflightBytes() == start, countMsg(what, inflightBytes(), start)
+  let l = settleLinger(lstart)
+  check l == lstart, what & ": " & $l & " lingering, want " & $lstart
+
+proc completeReject(c: Client; status: int) =
+  check statusOf(c.acc) == status, "answered " & $status & " (got " & $statusOf(c.acc) & ")"
+  check closesConn(c.acc), "the rejection says Connection: close"
+  check endsWith(c.acc, "\r\n\r\n"), "the whole response arrived"
+  check c.sendErr == 0, "every write was taken, none reset (got " & $c.sendErr &
+        (if c.sendErr == -ECONNRESET: ", ECONNRESET)" else: ")")
+  check c.endErr == 0, "then EOF, not a reset (got " & $c.endErr &
+        (if c.endErr == -ECONNRESET: ", ECONNRESET)" else: ")")
+
+proc bodyOverCapStillSending() {.passive.} =
+  section "linger: a 413 while the client is still sending its body"
+  let start = inflightBytes()
+  let lstart = lingeringNow()
+  let closed0 = lingerClosedTotal()
+  let c = newClient()
+  const total = 3 * 65536
+  const first = 65536 + 1024
+  sendAll(c, tooBig(total) & filled(first, 'x'))
+  # The rest of the body goes after the 413 has arrived. It fits the socket
+  # buffer, so a reset reaches a write that is not parked waiting for room.
+  let head = readHead(c)
+  sendAll(c, filled(32768, 'x'))
+  readToEof(c)
+  c.acc = head & c.acc
+  completeReject(c, 413)
+  discard cClose(c.fd)
+  check lingerEnded(closed0, getMonoTime(), 3000) >= 0, "the connection lingered"
+  settled("after the 413", start, lstart)
+
+proc headOverCapStillSending() {.passive.} =
+  section "linger: a 431 with kilobytes still unread behind the head"
+  let start = inflightBytes()
+  let lstart = lingeringNow()
+  let closed0 = lingerClosedTotal()
+  let c = newClient()
+  sendAll(c, getHead(MaxHead + 8192))
+  let head = readHead(c)
+  # The server half-closes before it drains, so EOF follows the response at
+  # once; without that it would come only when the idle linger ends.
+  let t = getMonoTime()
+  readToEof(c)
+  let eofMs = msSince(t)
+  c.acc = head & c.acc
+  completeReject(c, 431)
+  check eofMs < LingerIdleMs - 50, "EOF came straight after the response (" & $eofMs & " ms)"
+  discard cClose(c.fd)
+  check lingerEnded(closed0, getMonoTime(), 3000) >= 0, "the connection lingered"
+  settled("after the 431", start, lstart)
+
+proc tricklingClient() {.passive.} =
+  section "linger: a client trickling a byte every 100 ms is cut off at lingerMs"
+  let start = inflightBytes()
+  let lstart = lingeringNow()
+  let closed0 = lingerClosedTotal()
+  let c = newClient()
+  send(c, tooBig(5000))
+  let head = readHead(c)
+  let t0 = getMonoTime()
+  check statusOf(head) == 413, "answered 413"
+  var ended = -1
+  var next = 0
+  var seen = false
+  while ended < 0 and msSince(t0) < LingerMs + 2000:
+    if msSince(t0) >= next:
+      discard writeNow(c.fd, "x", 0)
+      next = next + 100
+    if lingeringNow() > lstart: seen = true
+    sleepMs(5)
+    if lingerClosedTotal() > closed0: ended = msSince(t0)
+  check seen, "the connection was counted as lingering"
+  check ended > LingerIdleMs + 100,
+        "the trickle kept it past lingerIdleMs (ended at " & $ended & " ms)"
+  check ended >= 0 and ended <= LingerMs + Slack,
+        "ended by lingerMs + slack (ended at " & $ended & " ms)"
+  discard cClose(c.fd)
+  settled("after the trickle", start, lstart)
+
+proc silentClient() {.passive.} =
+  section "linger: a silent client that never closes is cut off at lingerIdleMs"
+  let start = inflightBytes()
+  let lstart = lingeringNow()
+  let closed0 = lingerClosedTotal()
+  let c = newClient()
+  send(c, tooBig(5000))
+  let head = readHead(c)
+  let t0 = getMonoTime()
+  check statusOf(head) == 413, "answered 413"
+  let ended = lingerEnded(closed0, t0, LingerMs + 2000)
+  check ended >= 0 and ended <= LingerIdleMs + Slack,
+        "ended by lingerIdleMs + slack (ended at " & $ended & " ms)"
+  check ended < LingerMs, "ended before lingerMs: the idle bound fired"
+  readToEof(c)
+  check c.endErr == 0, "EOF (got " & $c.endErr & ")"
+  discard cClose(c.fd)
+  settled("after the silent client", start, lstart)
+
+var gFloodFd: cint = -1
+var gFloodStop: int
+var gFloodDone: int
+var gFloodBuf: array[16384, byte]
+
+proc floodOnce(): int =
+  ## One write(2) of `gFloodBuf`: 1 when bytes went, 0 when the socket
+  ## buffer is full, -1 once the connection is gone.
+  let r = cWrite(gFloodFd, addr gFloodBuf[0], csize_t(gFloodBuf.len))
+  result = if r > 0: 1
+           elif r < 0 and (cErrno == EAGAIN or cErrno == EINTR): 0
+           else: -1
+
+proc flooder() {.passive.} =
+  ## Write to `gFloodFd` without pause until a write fails or the scenario
+  ## says stop. Plain write(2), not the ring: the server's drain is under
+  ## test, so the client's writes stay as simple as they can be.
+  var going = true
+  while going and atomicLoad(gFloodStop) == 0:
+    let r = floodOnce()
+    if r > 0: yieldTask()
+    elif r == 0: sleepMs(1)
+    else: going = false
+  atomicStore(gFloodDone, 1)
+
+proc floodingClient() {.passive.} =
+  section "linger: a flooding client is cut off at lingerMs; others are served meanwhile"
+  let start = inflightBytes()
+  let lstart = lingeringNow()
+  let closed0 = lingerClosedTotal()
+  let c = newClient()
+  send(c, tooBig(5000))
+  let head = readHead(c)
+  let t0 = getMonoTime()
+  check statusOf(head) == 413, "answered 413"
+  gFloodFd = c.fd
+  atomicStore(gFloodStop, 0)
+  atomicStore(gFloodDone, 0)
+  spawnTask flooder()
+  sleepMs(100)
+  let t1 = getMonoTime()
+  let n = newClient()
+  send(n, "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+  readToEof(n)
+  let took = msSince(t1)
+  discard cClose(n.fd)
+  check statusOf(n.acc) == 200, "a request on another connection answered 200"
+  check took < LingerMs div 2, "and promptly (" & $took & " ms)"
+  let ended = lingerEnded(closed0, t0, LingerMs + 2000)
+  check ended > LingerIdleMs + 100,
+        "the flood kept it past lingerIdleMs (ended at " & $ended & " ms)"
+  check ended >= 0 and ended <= LingerMs + Slack,
+        "ended by lingerMs + slack (ended at " & $ended & " ms)"
+  atomicStore(gFloodStop, 1)
+  var w = 0
+  while atomicLoad(gFloodDone) == 0 and w < 3000:
+    sleepMs(5)
+    w = w + 5
+  check atomicLoad(gFloodDone) == 1, "the flooder stopped"
+  discard cClose(c.fd)
+  settled("after the flood", start, lstart)
+
+proc lingerCapHolds() {.passive.} =
+  section "linger: past the cap, a rejected connection closes at once"
+  const Cap = 2
+  const Conns = 4
+  let saved = lingerCap()
+  let nofile = openFileLimit()
+  check nofile > 0, "RLIMIT_NOFILE is readable (" & $nofile & ")"
+  check saved == int64(min(MaxFds, nofile) div 4),
+        "serve set the cap to a quarter of min(MaxFds, RLIMIT_NOFILE) (" & $saved & ")"
+  setLingerCap(Cap)
+  let start = inflightBytes()
+  let lstart = lingeringNow()
+  let closed0 = lingerClosedTotal()
+  var cs: seq[Client] = @[]
+  var i = 0
+  while i < Conns:
+    cs.add newClient()
+    i = i + 1
+  i = 0
+  while i < Conns:
+    send(cs[i], tooBig(5000))
+    i = i + 1
+  var most = lstart
+  i = 0
+  while i < Conns:
+    readToEof(cs[i])
+    check statusOf(cs[i].acc) == 413 and cs[i].endErr == 0, "answered 413, then EOF"
+    most = max(most, lingeringNow())
+    i = i + 1
+  let now = lingeringNow()
+  most = max(most, now)
+  check now == lstart + Cap, "the cap's worth linger (" & $(now - lstart) & ")"
+  # A peer that has closed answers a write with a reset, which fails the
+  # next write; one that lingers drains it.
+  i = 0
+  while i < Conns:
+    discard writeNow(cs[i].fd, "p", 0)
+    i = i + 1
+  sleepMs(30)
+  var gone = 0
+  i = 0
+  while i < Conns:
+    if writeNow(cs[i].fd, "q", 0) < 0: gone = gone + 1
+    most = max(most, lingeringNow())
+    i = i + 1
+  check gone == Conns - Cap, "those past the cap closed at once (" & $gone & " closed)"
+  check most <= lstart + Cap, "never more than the cap lingering (" & $(most - lstart) & ")"
+  i = 0
+  while i < Conns:
+    discard cClose(cs[i].fd)
+    i = i + 1
+  settled("after the cap", start, lstart)
+  check lingerClosedTotal() - closed0 == Cap,
+        "only the cap's worth counted as lingered (" & $(lingerClosedTotal() - closed0) & ")"
+  setLingerCap(int(saved))
+
+proc lingerEqualsIdle() {.passive.} =
+  section "linger: lingerMs equal to lingerIdleMs ends at the bound"
+  let savedMs = gServerConfig.lingerMs
+  gServerConfig.lingerMs = LingerIdleMs
+  let start = inflightBytes()
+  let lstart = lingeringNow()
+  let closed0 = lingerClosedTotal()
+  let c = newClient()
+  send(c, tooBig(5000))
+  let head = readHead(c)
+  let t0 = getMonoTime()
+  check statusOf(head) == 413, "answered 413"
+  var ended = -1
+  var next = 0
+  while ended < 0 and msSince(t0) < LingerIdleMs + 2000:
+    if msSince(t0) >= next:
+      discard writeNow(c.fd, "x", 0)
+      next = next + 50
+    sleepMs(5)
+    if lingerClosedTotal() > closed0: ended = msSince(t0)
+  check ended >= 0 and ended <= LingerIdleMs + Slack,
+        "ended by lingerMs + slack (ended at " & $ended & " ms)"
+  discard cClose(c.fd)
+  gServerConfig.lingerMs = savedMs
+  settled("after the bound", start, lstart)
+
+proc lingeringRefusals() {.passive.} =
+  section "linger: a cross-site 403 and a claimed upgrade with bytes behind it"
+  let start = inflightBytes()
+  let lstart = lingeringNow()
+  var closed0 = lingerClosedTotal()
+  let o = newClient()
+  send(o, upgradeRequest("/ws", "http://evil.example"))
+  finishClient(o)
+  check statusOf(o.acc) == 403 and o.endErr == 0, "answered 403, then EOF"
+  check lingerEnded(closed0, getMonoTime(), 3000) >= 0, "the 403 lingered"
+  closed0 = lingerClosedTotal()
+  let d = newClient()
+  send(d, upgradeRequest("/deny") & clientFrame(opText, "behind the upgrade"))
+  finishClient(d)
+  check statusOf(d.acc) == 401 and d.endErr == 0, "answered 401, then EOF"
+  check lingerEnded(closed0, getMonoTime(), 3000) >= 0,
+        "the claim lingered: the client had sent more than the request"
+  settled("after the refusals", start, lstart)
+
+proc noLinger() {.passive.} =
+  section "no linger after a response, a 400, a WebSocket session or a bare claim"
+  let start = inflightBytes()
+  let lstart = lingeringNow()
+  let closed0 = lingerClosedTotal()
+  let k = newClient()
+  send(k, "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+  check statusOf(readHead(k)) == 200, "first keep-alive response"
+  send(k, "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+  finishClient(k)
+  check countOf(k.acc, "HTTP/1.1 200") == 1, "second keep-alive response"
+  let b = newClient()
+  send(b, "GET /ok HTTP/1.1\r\nHost: localhost\r\nno colon here\r\n\r\ntrailing")
+  finishClient(b)
+  check statusOf(b.acc) == 400, "answered 400"
+  let w = newClient()
+  check openWs(w), "upgraded"
+  send(w, clientFrame(opClose, "\x03\xE8"))
+  discard readFrame(w)
+  finishClient(w)
+  let d = newClient()
+  send(d, upgradeRequest("/deny"))
+  finishClient(d)
+  check statusOf(d.acc) == 401, "a claim with nothing behind it answered 401"
+  sleepMs(LingerIdleMs + 100)
+  check lingerClosedTotal() == closed0,
+        "nothing lingered (" & $(lingerClosedTotal() - closed0) & " did)"
+  settled("after the non-lingering ends", start, lstart)
+
 proc runAll() {.passive.} =
   plainRequest()
   pipelinedPair()
@@ -455,6 +819,15 @@ proc runAll() {.passive.} =
   fragmentAbandoned()
   fragmentTooBig()
   fragmentProtocolError()
+  bodyOverCapStillSending()
+  headOverCapStillSending()
+  tricklingClient()
+  silentClient()
+  floodingClient()
+  lingerCapHolds()
+  lingerEqualsIdle()
+  lingeringRefusals()
+  noLinger()
   finish()
 
 # ── the server ──────────────────────────────────────────────────────────
@@ -470,7 +843,7 @@ proc denyGate(req: Request): Opt[Response] {.nimcall.} =
   if startsWith(path(req), "/deny"): result = some(newResponse(401))
   else: result = none[Response]()
 
-discard cAlarm(60)
+discard cAlarm(90)
 gPort = freePort()
 if gPort == 0'u16:
   writeLine(stderr, "test_inflight: no free loopback port")
@@ -479,6 +852,8 @@ var cfg = defaultServerConfig()
 cfg.maxBodySize = MaxBody
 cfg.maxRequestHead = MaxHead
 cfg.maxWsMessage = MaxMessage
+cfg.lingerMs = LingerMs
+cfg.lingerIdleMs = LingerIdleMs
 get("/ok", ok)
 post("/echo", echoBody)
 addBeforeMiddleware(denyGate)

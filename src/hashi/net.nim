@@ -1,5 +1,6 @@
 ## Sockets: listen-socket setup with structured failure, the peer's address,
-## and the per-connection options the server applies at accept.
+## the per-connection options the server applies at accept, the half-close
+## and peek a lingering close needs, and the process's open-file limit.
 ##
 ## `tryListenTcp` creates the listening socket and, instead of asserting on
 ## a failed `socket`, `bind` or `listen`, reports the failing call and its
@@ -36,6 +37,10 @@ const
   TCP_KEEPINTVL = 5.cint
   TCP_KEEPCNT = 6.cint
   TCP_USER_TIMEOUT = 18.cint
+  SHUT_WR = 1.cint
+  MSG_PEEK = 2.cint
+  MSG_DONTWAIT = 0x40.cint
+  RLIMIT_NOFILE = 7.cint
   INET6_ADDRSTRLEN = 46
 
 proc socket(domain, typ, protocol: cint): cint {.importc, header: "<sys/socket.h>".}
@@ -53,6 +58,18 @@ proc getpeername(fd: cint; sa: ptr CSockAddr; len: ptr SockLen): cint {.
   importc, header: "<sys/socket.h>".}
 proc signal(signum: cint; handler: pointer): pointer {.
   importc, header: "<signal.h>".}
+proc shutdownSocket(fd, how: cint): cint {.importc: "shutdown", header: "<sys/socket.h>".}
+proc recv(fd: cint; buf: pointer; len: csize_t; flags: cint): int {.
+  importc, header: "<sys/socket.h>".}
+
+type
+  RLimit {.importc: "struct rlimit", header: "<sys/resource.h>".} = object
+    ## The C struct itself, so the field widths follow the C headers.
+    rlim_cur: uint64
+    rlim_max: uint64
+
+proc getrlimit(resource: cint; rlim: ptr RLimit): cint {.
+  importc, header: "<sys/resource.h>".}
 
 var errno {.importc: "errno", header: "<errno.h>".}: cint
 
@@ -208,3 +225,26 @@ proc peerAddress*(fd: cint): string =
     let a = cast[ptr Sockaddr_in](addr sa6).sin_addr.s_addr
     result = $int(a and 0xff'u32) & "." & $int((a shr 8) and 0xff'u32) & "." &
              $int((a shr 16) and 0xff'u32) & "." & $int((a shr 24) and 0xff'u32)
+
+proc shutdownWrite*(fd: cint) =
+  ## Half-close: send FIN after whatever is already queued, and keep the
+  ## read side open. The peer reads the response, then EOF; reads on `fd`
+  ## still deliver what the peer sends.
+  discard shutdownSocket(fd, SHUT_WR)
+
+proc hasPendingInput*(fd: cint): bool =
+  ## Whether the peer has sent bytes that are waiting to be read, checked
+  ## without blocking and without taking them. False at EOF and on an error.
+  var b = 0'u8
+  result = recv(fd, addr b, csize_t(1), MSG_PEEK or MSG_DONTWAIT) > 0
+
+proc openFileLimit*(): int =
+  ## The soft `RLIMIT_NOFILE`: how many fds this process may hold open, or
+  ## -1 when it cannot be read. An unlimited soft limit reads as `high(int)`.
+  var r = default(RLimit)
+  if getrlimit(RLIMIT_NOFILE, addr r) != 0:
+    result = -1
+  elif r.rlim_cur > uint64(high(int)):
+    result = high(int)
+  else:
+    result = int(r.rlim_cur)

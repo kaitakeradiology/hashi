@@ -120,6 +120,21 @@ application; a stalled peer on the write side is the kernel's job via
 `TCP_USER_TIMEOUT` (60 s by default). `serve` exits 1 on a config
 `validateServerConfig` rejects.
 
+**Lingering close.** A 413, 431, 426 or 403 (and a before-middleware
+claim on a WebSocket upgrade or SSE request, when the client has sent
+more than the request) can reach a client that is still sending. Closing
+at once with its bytes unread makes the kernel answer with a reset, which
+can destroy the response before the client reads it. So once the response
+is written the driver shuts down its write side, then reads and discards
+until the client closes, sends nothing for `lingerIdleMs` (1 s by
+default), or `lingerMs` (5 s) has passed. At most a quarter of the smaller
+of `MaxFds` and the soft `RLIMIT_NOFILE` connections linger at once; past
+that a rejected connection closes at once. `lingeringNow` and
+`lingerClosedTotal` (`hashi/http/connreg`) report them. `lingerMs = 0`
+turns it off. A 400 never lingers. The linger narrows the window; no
+scheme guarantees a 413 reaches a client that reads only after it has
+finished sending an arbitrarily large upload.
+
 **Client IP.** `setTrustedProxies` names the direct peers whose
 `X-Real-IP` and `X-Forwarded-For` are honoured. With none configured, the
 socket peer is the client.

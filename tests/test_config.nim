@@ -27,6 +27,8 @@ block: check d.wsPingIntervalMs == 20_000, "WebSocket pings every 20 s of inboun
 block: check d.wsIdleTimeoutMs == 60_000, "WebSocket idle close after 60 s of inbound silence"
 block: check d.wsKeepalivePollMs == MaxKeepalivePollMs, "keepalive waits capped at MaxKeepalivePollMs"
 block: check MaxKeepalivePollMs == 20_000, "MaxKeepalivePollMs is 20 s"
+block: check d.lingerMs == 5000, "a rejected connection lingers up to 5 s by default"
+block: check d.lingerIdleMs == 1000, "and stops after 1 s of silence"
 
 section "validateServerConfig"
 block: check validateServerConfig(d) == "", "the defaults are valid"
@@ -76,6 +78,49 @@ block:
   c.wsPingIntervalMs = 0
   c.wsIdleTimeoutMs = 50
   check validateServerConfig(c) == "", "an idle close without pings is valid"
+block:
+  var c = defaultServerConfig()
+  c.lingerMs = -1
+  check validateServerConfig(c) == "lingerMs must be between 0 and 60000 (got -1)",
+        "a negative linger is refused"
+block:
+  var c = defaultServerConfig()
+  c.lingerMs = 60_001
+  check validateServerConfig(c) == "lingerMs must be between 0 and 60000 (got 60001)",
+        "a linger over a minute is refused"
+block:
+  var c = defaultServerConfig()
+  c.lingerMs = 60_000
+  c.lingerIdleMs = 60_000
+  check validateServerConfig(c) == "", "a linger of exactly a minute is valid"
+block:
+  var c = defaultServerConfig()
+  c.lingerMs = 1000
+  c.lingerIdleMs = 0
+  check validateServerConfig(c) == "lingerIdleMs must be positive while lingerMs is set (got 0)",
+        "a zero linger idle bound is refused while lingering is on"
+block:
+  var c = defaultServerConfig()
+  c.lingerMs = 1000
+  c.lingerIdleMs = -3
+  check validateServerConfig(c) == "lingerIdleMs must be positive while lingerMs is set (got -3)",
+        "a negative linger idle bound is refused while lingering is on"
+block:
+  var c = defaultServerConfig()
+  c.lingerMs = 1000
+  c.lingerIdleMs = 1001
+  check validateServerConfig(c) == "lingerIdleMs (1001) must not exceed lingerMs (1000)",
+        "a linger idle bound over lingerMs is refused"
+block:
+  var c = defaultServerConfig()
+  c.lingerMs = 1000
+  c.lingerIdleMs = 1000
+  check validateServerConfig(c) == "", "a linger idle bound equal to lingerMs is valid"
+block:
+  var c = defaultServerConfig()
+  c.lingerMs = 0
+  c.lingerIdleMs = 0
+  check validateServerConfig(c) == "", "linger off (0) leaves lingerIdleMs unchecked"
 
 section "inflight accounting"
 # The accept gate reads one number: bytes buffered across connections and not

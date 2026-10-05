@@ -67,15 +67,29 @@ stops reading altogether is the kernel's to drop: `TCP_USER_TIMEOUT` is now
 on by default (60 s). `tests/test_ws_idle.nim` and
 `tests/test_ws_backstop.nim` pin both ends.
 
-### 4. 431/413 rejections can arrive as a reset, not the response — kept
+### 4. 431/413 rejections can arrive as a reset, not the response — fixed
 
-On any 431 or 413 the driver writes the status and closes without draining
-what the client is still sending. If bytes remain unread in the kernel
+On any 431 or 413 the driver wrote the status and closed without draining
+what the client was still sending. If bytes remain unread in the kernel
 receive buffer at `close`, or arrive after it, the kernel answers with RST
 and the client may lose the status line. That covers an unterminated head
 over `maxRequestHead`, a complete head over it followed by a body or by
-pipelined requests, and a Content-Length over `maxBodySize`. Cosmetic: the
-connection ends either way, and the status is for the logs. Left as is.
+pipelined requests, and a Content-Length over `maxBodySize`; the 426 on a
+WebSocket-only listener, the cross-site 403 and a middleware claim on an
+upgrade or SSE request with bytes behind it are the same shape.
+
+Fix: a lingering close. Once the whole response is written, those
+rejections shut down the write side (the client reads the response, then
+EOF), then read and discard until the client closes, sends nothing for
+`lingerIdleMs` (1 s), or `lingerMs` (5 s) has passed. Never `SO_LINGER`.
+Limits: time only, no byte cap; at most a quarter of the smaller of
+`MaxFds` and the soft `RLIMIT_NOFILE` connections linger at once, and a
+rejection past that closes at once as before; `lingerMs = 0` turns it off;
+a 400 and the 503 at accept never linger. A client that reads only after
+finishing an arbitrarily large upload can still miss the 413: no scheme
+guarantees it. `tests/test_inflight.nim` pins the 413 and 431 against a
+client still sending (EOF, not ECONNRESET), the trickling, silent and
+flooding clients, and the cap.
 
 ### 5. Notes, no action
 

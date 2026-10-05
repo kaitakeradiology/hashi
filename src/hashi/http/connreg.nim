@@ -32,6 +32,10 @@
 ## the kernel's job (`TCP_USER_TIMEOUT`); see `hashi/http/server`. The
 ## WebSocket exceptions above apply only once the idle timeout has passed.
 ##
+## Lingering closes are bounded globally: a rejected connection lingers only
+## while fewer than `lingerCap` others are (`tryEnterLinger`), else it closes
+## at once. `lingeringNow` and `lingerClosedTotal` report them.
+##
 ## Lock-free: the connection worker writes its slot's deadline and the reaper
 ## reads it, both via aligned 64-bit atomics. fd reuse needs no generation
 ## counter because deadlines are monotonic-nanosecond values (effectively
@@ -55,6 +59,9 @@ var gDeadline: array[MaxFds, int64]   ## 0 = not watched; else the deadline in m
 var gReapCount: int64                 ## Total connections reaped, for `reapedTotal`.
 var gWsIdleCloseCount: int64          ## WebSocket idle closes, for `wsIdleClosedTotal`.
 var gInflight: int64                  ## Bytes buffered across connections, not yet consumed.
+var gLingering: int64                 ## Connections lingering now, for `lingeringNow`.
+var gLingerClosed: int64              ## Lingering closes finished, for `lingerClosedTotal`.
+var gLingerCap: int64 = MaxFds div 4  ## Most connections lingering at once; see `setLingerCap`.
 
 proc addInflight*(n: int) =
   ## Count `n` bytes read into a connection buffer.
@@ -119,3 +126,45 @@ proc wsIdleClosedTotal*(): int64 =
   ## since boot, for app /metrics. Counted apart from `reapedTotal`: the
   ## keepalive closes these itself, with a CLOSE 1001.
   atomicLoad(gWsIdleCloseCount)
+
+proc setLingerCap*(n: int) =
+  ## Set how many connections may linger at once; 0 or less turns lingering
+  ## off. `serve` sets it to a quarter of the smaller of `MaxFds` and the
+  ## soft `RLIMIT_NOFILE`, so lingering connections cannot take the fds new
+  ## ones need. For tests and tuning; call after `serve` has started to
+  ## override that.
+  atomicStore(gLingerCap, int64(max(n, 0)))
+
+proc lingerCap*(): int64 =
+  ## How many connections may linger at once.
+  atomicLoad(gLingerCap)
+
+proc tryEnterLinger*(): bool =
+  ## Claim a lingering slot: true, and counted in `lingeringNow`, while
+  ## fewer than `lingerCap` connections linger; false otherwise. A true
+  ## answer must be paired with `leaveLinger`.
+  result = false
+  var cur = atomicLoad(gLingering)
+  var trying = true
+  while trying:
+    if cur >= atomicLoad(gLingerCap):
+      trying = false
+    elif atomicCompareExchange(gLingering, cur, cur + 1):
+      result = true
+      trying = false
+    # A failed exchange reloaded `cur`; try again against the new count.
+
+proc leaveLinger*() =
+  ## Release the slot `tryEnterLinger` claimed and count the finished close.
+  discard atomicFetchSub(gLingering, 1'i64)
+  discard atomicFetchAdd(gLingerClosed, 1'i64)
+
+proc lingeringNow*(): int64 =
+  ## Connections lingering after a rejection right now, at most `lingerCap`
+  ## (for app /metrics).
+  atomicLoad(gLingering)
+
+proc lingerClosedTotal*(): int64 =
+  ## Cumulative lingering closes finished since boot (for app /metrics).
+  ## A rejected connection turned away by `lingerCap` is not counted.
+  atomicLoad(gLingerClosed)
