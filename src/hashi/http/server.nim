@@ -603,7 +603,8 @@ proc acceptLoop(listenFd: cint; extraIdx: int) {.passive.} =
         # cannot be tracked. Refuse it; this caps concurrent connections.
         log(warn, "refusing fd " & $fd.int & " >= MaxFds " & $MaxFds & " (at connection cap)")
         discard close(fd.cint)
-      elif inflightBytes() >= gServerConfig.maxInflightBytes:
+      elif gServerConfig.maxInflightBytes > 0 and
+           inflightBytes() >= gServerConfig.maxInflightBytes:
         # The aggregate cap: per-connection caps bound one connection, this
         # bounds all of them. Bytes already buffered by live connections
         # outgrow the budget; new ones are refused, not queued.

@@ -63,6 +63,15 @@ block:
         "a negative idle timeout is refused"
 block:
   var c = defaultServerConfig()
+  c.maxInflightBytes = -1
+  check validateServerConfig(c) == "maxInflightBytes must not be negative (got -1)",
+        "a negative in-flight budget is refused"
+block:
+  var c = defaultServerConfig()
+  c.maxInflightBytes = 0
+  check validateServerConfig(c) == "", "an in-flight budget of 0 (no budget) is valid"
+block:
+  var c = defaultServerConfig()
   c.wsPingIntervalMs = 100
   c.wsIdleTimeoutMs = 150
   check validateServerConfig(c) ==

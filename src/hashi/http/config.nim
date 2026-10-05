@@ -48,7 +48,8 @@ type
     reapIntervalMs*: int     ## Reaper sweep period; 0 means 1000 while `idleTimeoutMs`
                              ## or `wsIdleTimeoutMs` is set.
     maxInflightBytes*: int   ## Refuse new connections at this many bytes buffered
-                             ## across all connections (see `hashi/http/connreg`).
+                             ## across all connections (see `hashi/http/connreg`);
+                             ## 0 = no budget.
     # WebSocket keepalive, run by a `wsRecv` parked for inbound bytes. Both
     # clocks count from the last inbound byte only: a write succeeding proves
     # just that the kernel buffered it. See `recvMessage` in
@@ -113,13 +114,16 @@ proc defaultServerConfig*(): ServerConfig =
 
 proc validateServerConfig*(c: ServerConfig): string =
   ## "" when `c` is usable, else a one-line reason. Refuses a
-  ## `maxRequestHead` that is not positive, a negative `wsPingIntervalMs` or
-  ## `wsIdleTimeoutMs`, a `wsIdleTimeoutMs` under twice `wsPingIntervalMs`
-  ## when both are set, a `lingerMs` outside 0..`MaxLingerMs`, and, while
-  ## `lingerMs` is set, a `lingerIdleMs` that is not positive or exceeds it.
+  ## `maxRequestHead` that is not positive, a negative `maxInflightBytes`,
+  ## `wsPingIntervalMs` or `wsIdleTimeoutMs`, a `wsIdleTimeoutMs` under twice
+  ## `wsPingIntervalMs` when both are set, a `lingerMs` outside
+  ## 0..`MaxLingerMs`, and, while `lingerMs` is set, a `lingerIdleMs` that is
+  ## not positive or exceeds it.
   result = ""
   if c.maxRequestHead <= 0:
     result = "maxRequestHead must be positive (got " & $c.maxRequestHead & ")"
+  elif c.maxInflightBytes < 0:
+    result = "maxInflightBytes must not be negative (got " & $c.maxInflightBytes & ")"
   elif c.wsPingIntervalMs < 0:
     result = "wsPingIntervalMs must not be negative (got " & $c.wsPingIntervalMs & ")"
   elif c.wsIdleTimeoutMs < 0:
