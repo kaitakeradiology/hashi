@@ -8,6 +8,14 @@ notes.
 
 ## [Unreleased]
 
+### Changed
+
+- CI is pinned to Nimony `1f232868`, was `564d789e`: the older pin predates
+  nim-lang/nimony#2588, which sizes `std/threadpool` from the CPU affinity
+  and no longer pins workers, so a server confined to a CPU subset (a
+  container cpuset) spawned one worker per host CPU and stalled. Build hashi
+  with Nimony `1f232868` or later.
+
 ## [0.1.6] - 2026-10-06
 
 ### Added
