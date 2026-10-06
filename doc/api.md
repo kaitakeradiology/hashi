@@ -141,7 +141,8 @@ idle reaper that shuts down an HTTP connection blocked on a read with no
 inbound bytes, and the WebSocket keepalive. Writes are never timed by the
 application; a stalled peer on the write side is the kernel's job via
 `TCP_USER_TIMEOUT` (60 s by default). `serve` exits 1 on a config
-`validateServerConfig` rejects.
+`validateServerConfig` rejects, and on a trusted-proxy entry
+`trustedProxyFaults` reports.
 
 **Lingering close.** A 413, 431, 426 or 403 (and a before-middleware
 claim on a WebSocket upgrade or SSE request, when the client has sent
@@ -160,7 +161,20 @@ finished sending an arbitrarily large upload.
 
 **Client IP.** `setTrustedProxies` names the direct peers whose
 `X-Real-IP` and `X-Forwarded-For` are honoured. With none configured, the
-socket peer is the client.
+socket peer is the client. Each entry must be a bare IPv4 or IPv6 literal
+(no CIDR, hostname, port, zone id or brackets) that is neither unspecified
+(`0.0.0.0`, `::`) nor multicast; `trustedProxyFaults` names any that are
+not, and `serve` then exits 1. Addresses are compared and reported in
+`parseIpLiteral`'s canonical text (`hashi/net`), the form `peerAddress`
+uses: a dotted quad for IPv4 and IPv4-mapped IPv6, compressed lower-case
+IPv6 otherwise. From a trusted peer, one `X-Real-IP` line that is an IP
+literal is the client; otherwise `X-Forwarded-For` is walked right to left
+past trusted hops, and the first other hop is the client if it is an IP
+literal. A trusted peer's forwarded headers that name no usable client
+leave `remoteAddress` "" (unattributed), never the peer. A trusted proxy
+that appends `X-Forwarded-For` without overwriting `X-Real-IP` is logged
+as a warning; one that passes both client headers through unchanged
+cannot be detected here. See `hashi/http/forwarded`.
 
 ## WebSocket
 

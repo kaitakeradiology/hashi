@@ -54,6 +54,7 @@ The in-process fuzzers, run by CI:
    | `fuzz_router` | `matchRoute` on random patterns and targets, targets derived from a pattern matching it with the right captures |
    | `fuzz_multipart` | `parseMultipartForm` on random bodies, then generated forms with CRLFs and decoy boundaries in the data parsed back exactly |
    | `fuzz_buffer` | `hashi/buffer` against a plain-string model across the string's inline and heap tiers |
+   | `fuzz_forwarded` | `parseIpLiteral` on random and near-miss address text, every accepted literal canonical; `attributedClientIp` from a trusted peer on random forwarded headers: "" or a canonical literal, the peer only when a header names it |
 
 ## Findings (Jun 2026)
 

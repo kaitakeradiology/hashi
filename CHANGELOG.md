@@ -31,8 +31,39 @@ notes.
   `lingeringNow`, `lingerClosedTotal`, `lingerCap` and `setLingerCap`
   (`hashi/http/connreg`) report and bound it; `shutdownWrite`,
   `hasPendingInput` and `openFileLimit` (`hashi/net`).
+- `parseIpLiteral` (`hashi/net`): the canonical text of an IPv4 or IPv6
+  literal, the form `peerAddress` renders, or "".
+- `trustedProxyFaults` (`hashi/http/forwarded`): the `setTrustedProxies`
+  entries refused, and why; `serve` logs them and exits 1.
+- `forwardedWarning` (`hashi/http/forwarded`): the warning `clientIp` logs
+  for a trusted proxy's forwarded headers.
 
 ### Changed
+
+- **Upgrade note:** `serve` now REFUSES TO START when a
+  `setTrustedProxies` entry is not a bare, unicast, specified IPv4/IPv6
+  literal: no CIDR, hostname, port, zone id or brackets, and not
+  `0.0.0.0`, `::` or multicast. Such entries previously matched nothing,
+  silently. Check deployed `trusted_proxies` values before upgrading. A
+  blank entry is dropped, not refused.
+- Forwarded client addresses are parsed and canonicalised. Trusted
+  proxies, `X-Real-IP` and `X-Forwarded-For` hops are compared as
+  addresses, so `::ffff:127.0.0.1` matches `127.0.0.1`. A trusted proxy's
+  forwarded headers that name no usable client now give an unattributed
+  `remoteAddress` (`""`) instead of the raw string: an `X-Real-IP` and
+  right-most untrusted `X-Forwarded-For` hop that are not IP literals, a
+  walk that finds only trusted hops, or more than one `X-Real-IP` line with
+  no usable `X-Forwarded-For`. The `X-Forwarded-For` walk stops at the
+  first hop it cannot use instead of skipping it. Repeated
+  `X-Forwarded-For` lines are joined in order; more than one `X-Real-IP`
+  line is ignored. `attributedClientIp` takes every `X-Real-IP` line and
+  the joined `X-Forwarded-For`.
+- `clientIp` logs a warning, at most once a minute per proxy and kind on
+  each worker thread, when a trusted proxy appends `X-Forwarded-For`
+  without overwriting `X-Real-IP` (`X-Real-IP` equals neither the last
+  hop nor the right-most untrusted one), sends more than one `X-Real-IP`,
+  or sends one that is not an IP literal. A proxy that passes both client
+  headers through unchanged is not detected.
 
 - `decodeChunked` appends to `body` and reports its consumed prefix when
   incomplete; the driver resumes rather than restarts, so a chunked body

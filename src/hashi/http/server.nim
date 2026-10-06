@@ -533,7 +533,7 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
   # Only a trusted proxy's forwarded headers change the client address, so
   # for any other peer it is settled here rather than per request.
   let viaProxy = isTrustedProxy(c.peer)
-  let peerIp = if viaProxy: "" else: attributedClientIp(c.peer, "", "")
+  let peerIp = if viaProxy: "" else: attributedClientIp(c.peer, @[], "")
   var keepGoing = true
   while keepGoing:
     keepGoing = false
@@ -653,11 +653,16 @@ proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
   ## dual-stack wildcard, "0.0.0.0" for IPv4 only, or a specific address such
   ## as "127.0.0.1" for loopback only. See `tryListenTcp`.
   ##
-  ## A config `validateServerConfig` rejects is logged at error level and
-  ## the process exits 1 before anything listens.
+  ## A config `validateServerConfig` rejects, or a `setTrustedProxies` entry
+  ## `trustedProxyFaults` reports, is logged at error level and the process
+  ## exits 1 before anything listens.
   let bad = validateServerConfig(config)
   if bad.len > 0:
     log(LogLevel.error, "hashi http: invalid server config — " & bad)
+    quit(1)
+  let badProxies = trustedProxyFaults()
+  if badProxies.len > 0:
+    log(LogLevel.error, "hashi http: invalid trusted proxies — " & badProxies)
     quit(1)
   setServerConfig(config)
   let nofile = openFileLimit()
