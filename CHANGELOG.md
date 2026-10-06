@@ -8,6 +8,8 @@ notes.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-10-06
+
 ### Added
 
 - `maxInflightBytes` (`hashi/http/config`) and the byte count it gates on
