@@ -1,6 +1,7 @@
-## Sockets: listen-socket setup with structured failure, the peer's address,
-## the per-connection options the server applies at accept, the half-close
-## and peek a lingering close needs, and the process's open-file limit.
+## Sockets: listen-socket setup with structured failure, the peer's address
+## and IP-literal parsing in the same canonical text, the per-connection
+## options the server applies at accept, the half-close and peek a lingering
+## close needs, and the process's open-file limit.
 ##
 ## `tryListenTcp` creates the listening socket and, instead of asserting on
 ## a failed `socket`, `bind` or `listen`, reports the failing call and its
@@ -207,33 +208,76 @@ proc ignoreSigpipe*() =
   ## the process.
   discard signal(13.cint, cast[pointer](1))
 
+proc addressText(a: array[16, uint8]): string =
+  ## The canonical text of IPv6 address `a`: a dotted quad when it is
+  ## IPv4-mapped (`::ffff:a.b.c.d`), otherwise `inet_ntop`'s compressed,
+  ## lower-case form; "" if `inet_ntop` fails.
+  var mapped = a[10] == 0xff'u8 and a[11] == 0xff'u8
+  for i in 0 ..< 10:
+    if a[i] != 0'u8: mapped = false
+  result = ""
+  if mapped:
+    result = $int(a[12]) & "." & $int(a[13]) & "." & $int(a[14]) & "." & $int(a[15])
+  else:
+    var src = a
+    var buf = default(array[INET6_ADDRSTRLEN, char])
+    if inet_ntop(AF_INET6, addr src, cast[cstring](addr buf[0]),
+                 SockLen(INET6_ADDRSTRLEN)) != nil:
+      for c in buf:
+        if c == char(0): break
+        result.add c
+
+proc mappedFrom(v4: array[4, uint8]): array[16, uint8] =
+  ## IPv4 address `v4` (network byte order) as `::ffff:a.b.c.d`.
+  result = default(array[16, uint8])
+  result[10] = 0xff'u8
+  result[11] = 0xff'u8
+  for i in 0 ..< 4: result[12 + i] = v4[i]
+
 proc peerAddress*(fd: cint): string =
-  ## The socket peer's address as text: dotted quad for IPv4 and for
-  ## IPv4-mapped IPv6 (what a dual-stack listener sees from IPv4 clients),
-  ## full IPv6 text otherwise, "?" if unavailable.
+  ## The socket peer's address as text, in `parseIpLiteral`'s canonical
+  ## form: dotted quad for IPv4 and for IPv4-mapped IPv6 (what a dual-stack
+  ## listener sees from IPv4 clients), compressed lower-case IPv6 otherwise,
+  ## "?" if unavailable.
   var sa6 = default(Sockaddr_in6)   # large enough for a sockaddr_in too
   var sl = SockLen(sizeof(sa6))
   if getpeername(fd, cast[ptr CSockAddr](addr sa6), addr sl) != 0:
     return "?"
   if sa6.sin6_family == uint16(AF_INET6):
-    var mapped = true
-    for i in 0 ..< 10:
-      if sa6.sin6_addr[i] != 0'u8: mapped = false
-    if mapped and sa6.sin6_addr[10] == 0xff'u8 and sa6.sin6_addr[11] == 0xff'u8:
-      result = $int(sa6.sin6_addr[12]) & "." & $int(sa6.sin6_addr[13]) & "." &
-               $int(sa6.sin6_addr[14]) & "." & $int(sa6.sin6_addr[15])
-    else:
-      var buf = default(array[INET6_ADDRSTRLEN, char])
-      discard inet_ntop(AF_INET6, addr sa6.sin6_addr, cast[cstring](addr buf[0]),
-                        SockLen(INET6_ADDRSTRLEN))
-      result = ""
-      for c in buf:
-        if c == char(0): break
-        result.add c
+    result = addressText(sa6.sin6_addr)
   else:
-    let a = cast[ptr Sockaddr_in](addr sa6).sin_addr.s_addr
-    result = $int(a and 0xff'u32) & "." & $int((a shr 8) and 0xff'u32) & "." &
-             $int((a shr 16) and 0xff'u32) & "." & $int((a shr 24) and 0xff'u32)
+    var sa4 = cast[ptr Sockaddr_in](addr sa6)[]
+    var v4 = default(array[4, uint8])
+    copyMem(addr v4, addr sa4.sin_addr, 4)
+    result = addressText(mappedFrom(v4))
+  if result.len == 0: result = "?"
+
+const MaxIpLiteral = 45
+  ## The longest IPv6 text form, `ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255`.
+
+proc parseIpLiteral*(s: string): string =
+  ## The canonical text of the IPv4 or IPv6 address literal `s`, the form
+  ## `peerAddress` renders, or "" when `s` is not one. Leading and trailing
+  ## spaces and tabs are ignored. What remains must be at most 45 bytes of
+  ## `[0-9A-Fa-f:.]` that `inet_pton` accepts, so a CIDR suffix, port, zone
+  ## id, brackets, hostname, control byte or NUL is refused. IPv4 octets
+  ## take no leading zeros.
+  result = ""
+  var a = 0
+  var b = s.len
+  while a < b and (s[a] == ' ' or s[a] == '\t'): inc a
+  while b > a and (s[b - 1] == ' ' or s[b - 1] == '\t'): dec b
+  if b == a or b - a > MaxIpLiteral: return
+  for i in a ..< b:
+    let c = s[i]
+    if not (c in {'0'..'9', 'a'..'f', 'A'..'F', ':', '.'}): return
+  var t = substr(s, a, b - 1)
+  var v4 = default(array[4, uint8])
+  var v6 = default(array[16, uint8])
+  if inet_pton(AF_INET, toCString(t), addr v4) == 1:
+    result = addressText(mappedFrom(v4))
+  elif inet_pton(AF_INET6, toCString(t), addr v6) == 1:
+    result = addressText(v6)
 
 proc shutdownWrite*(fd: cint) =
   ## Half-close: send FIN after whatever is already queued, and keep the
