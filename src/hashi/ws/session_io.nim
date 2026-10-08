@@ -27,6 +27,7 @@ import hashi/loop
 import hashi/buffer
 import hashi/http/request
 import hashi/http/config
+import hashi/private/cfgview
 import hashi/http/connreg   # setDeadline, addInflight/subInflight, countWsIdleClose
 import hashi/ws/frame
 import hashi/ws/protocol

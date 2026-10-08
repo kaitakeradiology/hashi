@@ -23,6 +23,7 @@ import std/[syncio, opt, strutils, monotimes, times]
 from std/posix/posix import close
 import hashi/net
 import hashi/http/config
+import hashi/private/cfgview
 import hashi/http/connreg
 import hashi/http/request
 import hashi/http/router

@@ -21,7 +21,7 @@
 ## The linger scenarios watch `lingeringNow` and `lingerClosedTotal` to time
 ## how long the server lingers against a trickling, a silent and a flooding
 ## client, and that the cap on lingering connections holds.
-import std/[syncio, strutils, opt, monotimes, times, atomics]
+import std/[syncio, strutils, opt, monotimes, times, atomics, cmdline]
 from std/posix/posix import Sockaddr_in, SockLen, errno
 import hashi
 import hashi/buffer
@@ -47,6 +47,7 @@ proc cWrite(fd: cint; buf: pointer; n: csize_t): int {.importc: "write", header:
 const EAGAIN = 11.cint
 const EINTR = 4.cint
 proc cAlarm(seconds: cuint): cuint {.importc: "alarm", header: "<unistd.h>".}
+proc cSystem(cmd: cstring): cint {.importc: "system", header: "<stdlib.h>".}
   ## The watchdog: a scenario that never sees its EOF fails the run instead
   ## of hanging it.
 const ShutWr = 1.cint
@@ -89,6 +90,16 @@ proc freePort(): uint16 =
 
 let gPort = freePort()
 let gWsPort = freePort()   ## the WebSocket-only listener
+
+const EqualsMode = "linger-equals-idle"
+let gEqualsChildMode = paramCount() >= 1 and paramStr(1) == EqualsMode
+proc runEqualsChildProcess(): int =
+  result = 0
+  if not gEqualsChildMode:
+    var cmd = paramStr(0) & " " & EqualsMode
+    result = int(cSystem(toCString(cmd)))
+let gEqualsChild = runEqualsChildProcess()
+  ## The `lingerMs == lingerIdleMs` scenario's child process status (see `lingerEqualsIdle`).
 
 proc dial(port: uint16): cint =
   ## A non-blocking client socket connected to the server on `port`. Loopback connects
@@ -710,12 +721,8 @@ proc lingerCapHolds() {.passive.} =
         "only the cap's worth counted as lingered (" & $(lingerClosedTotal() - closed0) & ")"
   setLingerCap(int(saved))
 
-proc lingerEqualsIdle() {.passive.} =
-  section "linger: lingerMs equal to lingerIdleMs ends at the bound"
-  # Written in place: `setServerConfig` aborts once `serve` has sealed the boot config.
-  let live = serverConfigView()
-  let savedMs = live[].lingerMs
-  live[].lingerMs = LingerIdleMs
+proc lingerEqualsIdleBody() {.passive.} =
+  ## Runs only in the child process, whose config has `lingerMs == lingerIdleMs`.
   let start = inflightBytes()
   let lstart = lingeringNow()
   let closed0 = lingerClosedTotal()
@@ -735,8 +742,14 @@ proc lingerEqualsIdle() {.passive.} =
   check ended >= 0 and ended <= LingerIdleMs + Slack,
         "ended by lingerMs + slack (ended at " & $ended & " ms)"
   discard cClose(c.fd)
-  live[].lingerMs = savedMs
   settled("after the bound", start, lstart)
+
+proc lingerEqualsIdle() =
+  ## `lingerMs` is sealed once `serve` starts, so this scenario runs in a child
+  ## (this binary re-run with `linger-equals-idle`) served with its own config.
+  ## The parent ran the child before its own `serve` and reports its status here.
+  section "linger: lingerMs equal to lingerIdleMs ends at the bound"
+  check gEqualsChild == 0, "the child process passed (status " & $gEqualsChild & ")"
 
 proc lingeringRefusals() {.passive.} =
   section "linger: a cross-site 403 and a claimed upgrade with bytes behind it"
@@ -807,6 +820,10 @@ proc noLinger() {.passive.} =
   check lingerClosedTotal() == closed0,
         "nothing lingered (" & $(lingerClosedTotal() - closed0) & " did)"
   settled("after the non-lingering ends", start, lstart)
+
+proc runEqualsChild() {.passive.} =
+  lingerEqualsIdleBody()
+  finish()
 
 proc runAll() {.passive.} =
   plainRequest()
@@ -890,7 +907,7 @@ var cfg = defaultServerConfig()
 cfg.maxBodySize = MaxBody
 cfg.maxRequestHead = MaxHead
 cfg.maxWsMessage = MaxMessage
-cfg.lingerMs = LingerMs
+cfg.lingerMs = if gEqualsChildMode: LingerIdleMs else: LingerMs
 cfg.lingerIdleMs = LingerIdleMs
 get("/ok", ok)
 post("/echo", echoBody)
@@ -899,5 +916,6 @@ setSseHandler(isSse, sseNever)
 if not addWsListener(gWsPort, wsOnly, bindAddr = "127.0.0.1"):
   writeLine(stderr, "test_inflight: no WebSocket-only listener")
   quit(1)
-setBootTask(runAll)
+if gEqualsChildMode: setBootTask(runEqualsChild)
+else: setBootTask(runAll)
 serve(gPort, cfg, bindAddr = "127.0.0.1")

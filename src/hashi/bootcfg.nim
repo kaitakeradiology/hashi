@@ -8,6 +8,19 @@
 ## `FATAL hashi: boot config changed after serve()` to fd 2 and aborts, so a
 ## late registration fails loudly instead of racing the workers.
 ##
+## Seal, `publish` and `edit` take one spin lock (boot-time only, held for a
+## check and a store), so a `publish` either lands before the seal or aborts.
+## `edit` checks under the lock but its caller writes after it returns, so
+## registration through `edit` must happen on the thread that later calls
+## `serve`, as every caller does; a concurrent `edit` racing the seal is not
+## covered. `view` and
+## `snapshot` stay lock-free.
+##
+## Visibility: a reader's acquire load of the seal flag pairs with
+## `sealBootConfig`'s release store, so everything that happens-before the seal
+## (including in-place writes through `edit`, made by the sealing thread or
+## published to it) is visible to any reader that finds the config sealed.
+##
 ## A stored value is never freed. That is what makes the raw `ptr T` from
 ## `view` safe to hold, and why a request path reads a `Router` or a handler
 ## table without copying it. `snapshot` copies, which is sound because the
@@ -18,6 +31,7 @@
 ## (`ServerConfig`, `LogLevel`) is published once from a module-level statement.
 
 import std/atomics
+import hashi/private/bootprobe
 when defined(posix):
   from std/posix/posix import write
 elif not (defined(wasm32) and defined(standalone)):
@@ -32,6 +46,7 @@ type
     p: int   # address of a `ptr T` from alloc0, never freed; 0 = unset
 
 var gSealed: bool   # only through atomicLoad/atomicStore, in .sync procs
+var gBootLock: int  # 0 free, 1 held; spin lock over the seal check + the store
 
 proc cAbort() {.importc: "abort", header: "<stdlib.h>", noreturn.}
 
@@ -45,15 +60,30 @@ proc die(msg: string) {.noreturn.} =
     write(stderr, msg & "\n")
   cAbort()
 
+proc lockBoot() {.sync.} =
+  var expected = 0
+  while not atomicCompareExchange(gBootLock, expected, 1):
+    expected = 0
+
+proc unlockBoot() {.sync.} =
+  atomicStore(gBootLock, 0, moRelease)
+
 proc sealBootConfig*() {.sync.} =
   ## End of boot: every later `publish` or `edit` aborts. `serve` calls this.
+  lockBoot()
   atomicStore(gSealed, true, moRelease)
+  unlockBoot()
 
 proc bootConfigSealed*(): bool {.sync.} =
   atomicLoad(gSealed, moAcquire)
 
-proc refuseIfSealed() {.sync.} =
-  if bootConfigSealed():
+proc refuseLate(): bool {.sync.} =
+  ## Called with the lock held and the config sealed. Aborts, unless the
+  ## test hook is on, in which case it releases the lock and returns true.
+  if probeLate():
+    unlockBoot()
+    result = true
+  else:
     die("FATAL hashi: boot config changed after serve()")
 
 proc slot[T](f: var Frozen[T]): int {.sync.} =
@@ -71,22 +101,32 @@ proc slot[T](f: var Frozen[T]): int {.sync.} =
 proc publish*[T](f: var Frozen[T]; v: sink T) {.sync.} =
   ## Install `v` as the value. Aborts once sealed. Replacing a value leaks the
   ## old one, which a reader may still hold.
-  refuseIfSealed()
   let q = cast[ptr T](alloc0(sizeof(T)))
   q[] = v
+  lockBoot()
+  if bootConfigSealed():
+    if refuseLate(): return
   atomicStore(f.p, cast[int](q), moRelease)
+  unlockBoot()
 
 proc edit*[T](f: var Frozen[T]): ptr T {.sync.} =
   ## The value in place, for a registration to append to. Aborts once sealed.
-  refuseIfSealed()
+  ## Writes through the result are visible to readers once they happen-before
+  ## `sealBootConfig` (see the module doc).
+  lockBoot()
+  if bootConfigSealed():
+    if refuseLate(): return nil
   result = cast[ptr T](slot(f))
+  unlockBoot()
 
 proc view*[T](f: var Frozen[T]): ptr T {.sync.} =
   ## The value in place, for reading only: never write through it.
+  discard bootConfigSealed()   # acquire: pairs with the seal's release
   result = cast[ptr T](slot(f))
 
 proc snapshot*[T: HasDefault](f: var Frozen[T]): T {.sync.} =
   ## A copy of the value, or `default(T)` if none was set.
+  discard bootConfigSealed()   # acquire: pairs with the seal's release
   let q = atomicLoad(f.p, moAcquire)
   if q == 0:
     result = default(T)
