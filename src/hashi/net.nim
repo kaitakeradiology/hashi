@@ -6,13 +6,15 @@
 ## `tryListenTcp` creates the listening socket and, instead of asserting on
 ## a failed `socket`, `bind` or `listen`, reports the failing call and its
 ## `errno` in a `ListenResult`, so `serve` can print a clear message and exit
-## non-zero. `listenError` renders that result for an operator. The socket
-## calls and constants here are Linux's; this is the module to port first
-## for another platform.
+## non-zero. `listenError` renders that result for an operator.
+## `listenLoopbackPair` listens on 127.0.0.1 and ::1 on one port, which is
+## what `serve` does for an empty bind address. The socket calls and
+## constants here are Linux's; this is the module to port first for another
+## platform.
 
 from std/posix/posix import close, fcntl, F_GETFL, F_SETFL, O_NONBLOCK,
   AF_INET, AF_INET6, SOCK_STREAM, IPPROTO_TCP, IPPROTO_IPV6, SOL_SOCKET,
-  SO_REUSEADDR, Sockaddr_in, SockLen
+  SO_REUSEADDR, Sockaddr_in, SockLen, EADDRNOTAVAIL, EAFNOSUPPORT
 import std/strutils
 
 # Socket calls and types `std/posix` does not declare yet.
@@ -50,11 +52,14 @@ proc bindSocket(s: cint; name: ptr CSockAddr; namelen: SockLen): cint {.
   importc: "bind", header: "<sys/socket.h>".}
 proc listenSocket(s, backlog: cint): cint {.importc: "listen", header: "<sys/socket.h>".}
 proc htons(x: uint16): uint16 {.importc, header: "<arpa/inet.h>".}
+proc ntohs(x: uint16): uint16 {.importc, header: "<arpa/inet.h>".}
 proc inet_pton(af: cint; src: cstring; dst: pointer): cint {.
   importc, header: "<arpa/inet.h>".}
 proc inet_ntop(af: cint; src: pointer; dst: cstring; size: SockLen): cstring {.
   importc, header: "<arpa/inet.h>".}
 proc getpeername(fd: cint; sa: ptr CSockAddr; len: ptr SockLen): cint {.
+  importc, header: "<sys/socket.h>".}
+proc getsockname(fd: cint; sa: ptr CSockAddr; len: ptr SockLen): cint {.
   importc, header: "<sys/socket.h>".}
 proc signal(signum: cint; handler: pointer): pointer {.
   importc, header: "<signal.h>".}
@@ -92,7 +97,8 @@ type
     ok*: bool       ## true when bound and listening
     fd*: cint       ## the listening fd when `ok`, -1 otherwise
     err*: cint      ## `errno` of the failing call, 0 when `ok`
-    stage*: string  ## the failing call: "socket", "bind", "listen" or "bindaddr"
+    stage*: string  ## the failing call: "socket", "bind", "listen", "bindaddr"
+                    ## or "getsockname"
 
 proc tryListenTcp*(port: uint16; backlog = 4096; bindAddr = ""): ListenResult =
   ## Create a non-blocking TCP listen socket on `port`. Never asserts.
@@ -102,7 +108,9 @@ proc tryListenTcp*(port: uint16; backlog = 4096; bindAddr = ""): ListenResult =
   ## client sees as one-second retransmit stalls rather than as an error.
   ##
   ## `bindAddr` is an address literal, never a hostname:
-  ##   - `""` or `"::"`: dual-stack wildcard (an IPv6 socket with
+  ##   - `""`: 127.0.0.1 only, so an unset address is reachable from this
+  ##     host alone. `listenLoopbackPair` adds ::1, as `serve` does
+  ##   - `"::"`: dual-stack wildcard, every interface (an IPv6 socket with
   ##     `IPV6_V6ONLY` off, so IPv4 clients arrive as v4-mapped addresses);
   ##     falls back to the IPv4 wildcard if the host has no IPv6
   ##   - `"::0"`: all IPv6 interfaces only (`IPV6_V6ONLY` on)
@@ -114,7 +122,7 @@ proc tryListenTcp*(port: uint16; backlog = 4096; bindAddr = ""): ListenResult =
   ## On failure the socket is closed and `err` holds the `errno` of the
   ## failing call.
   result = ListenResult(ok: false, fd: -1, err: 0, stage: "")
-  let dual = bindAddr.len == 0 or bindAddr == "::"
+  let dual = bindAddr == "::"
   var a4 = default(Sockaddr_in)
   a4.sin_family = uint16(AF_INET)
   a4.sin_port = htons(port)
@@ -123,7 +131,7 @@ proc tryListenTcp*(port: uint16; backlog = 4096; bindAddr = ""): ListenResult =
   a6.sin6_port = htons(port)
   var v6 = true
   if not dual and bindAddr != "::0":
-    var ba = bindAddr
+    var ba = if bindAddr.len == 0: "127.0.0.1" else: bindAddr
     if inet_pton(AF_INET, toCString(ba), addr a4.sin_addr) == 1:
       v6 = false
     elif inet_pton(AF_INET6, toCString(ba), addr a6.sin6_addr) != 1:
@@ -168,6 +176,44 @@ proc tryListenTcp*(port: uint16; backlog = 4096; bindAddr = ""): ListenResult =
   result.fd = fd
   result.err = 0
   result.stage = ""
+
+type
+  LoopbackPair* = object
+    ## Outcome of `listenLoopbackPair`. `v4.ok` is the outcome of the pair:
+    ## when it is false nothing is open, and the half whose `stage` is set
+    ## names the failing call.
+    v4*: ListenResult  ## 127.0.0.1
+    v6*: ListenResult  ## ::1, `IPV6_V6ONLY` on
+
+proc listenLoopbackPair*(port: uint16; backlog = 4096): LoopbackPair =
+  ## Listen on 127.0.0.1 and on ::1 on `port`: the loopback interface on
+  ## both families and no other. Never asserts.
+  ##
+  ## 127.0.0.1 is bound first, then ::1 on the port 127.0.0.1 actually got,
+  ## so a `port` of 0 gives both sockets one kernel-chosen port. Outcomes:
+  ##   - both `ok`: two listening, non-blocking fds on one port
+  ##   - `v4` failed: nothing is open; ::1 was not attempted (`v6.stage` "")
+  ##   - ::1 failed with `EADDRNOTAVAIL` or `EAFNOSUPPORT` (the host has no
+  ##     IPv6 loopback): `v4` stays open and `v6` holds the failure, for the
+  ##     caller to report as a warning
+  ##   - ::1 failed otherwise, such as `EADDRINUSE`: the 127.0.0.1 socket is
+  ##     closed, `v4.ok` is false with `v4.stage` "", and `v6` holds the
+  ##     failure
+  result = LoopbackPair(v4: tryListenTcp(port, backlog, "127.0.0.1"),
+                        v6: ListenResult(ok: false, fd: -1, err: 0, stage: ""))
+  if not result.v4.ok: return
+  var got = default(Sockaddr_in)
+  var gotLen = SockLen(sizeof(got))
+  if getsockname(result.v4.fd, cast[ptr CSockAddr](addr got), addr gotLen) != 0:
+    let e = errno
+    discard close(result.v4.fd)
+    result.v4 = ListenResult(ok: false, fd: -1, err: e, stage: "getsockname")
+    return
+  result.v6 = tryListenTcp(ntohs(got.sin_port), backlog, "::1")
+  if not result.v6.ok and result.v6.err != EADDRNOTAVAIL and
+      result.v6.err != EAFNOSUPPORT:
+    discard close(result.v4.fd)
+    result.v4 = ListenResult(ok: false, fd: -1, err: 0, stage: "")
 
 proc listenError*(r: ListenResult; port: uint16): string =
   ## One line describing a failed `tryListenTcp`, naming the busy port in

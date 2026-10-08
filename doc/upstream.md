@@ -7,7 +7,7 @@ upstream, with a reduced case, as time allows.
   forms**, which RFC 3629 and RFC 6455 reject and Autobahn's 6.x cases
   check. `hashi/ws/protocol` keeps its own validator.
 - **`std/ioring.listenTcp` is IPv4-only and asserts on failure.**
-  `hashi/net` has a dual-stack listen with structured errors.
+  `hashi/net` has an IPv4 and IPv6 listen with structured errors.
 - **Calling a proc value bound by a `for` loop variable** (`for m in procs:
   m(x)`) crashes the compiler in derefs (`fnType.isParamsTag`). Such
   loops are indexed in `hashi/http/router`.

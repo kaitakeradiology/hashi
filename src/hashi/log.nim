@@ -69,8 +69,8 @@ proc addSource(s: var string; file: string; line: int) =
   s.add ')'
 
 proc stderrLog*(level: LogLevel; file: string; line: int; msg: string) {.nimcall.} =
-  ## The default callback: one formatted line to stderr per record,
-  ## e.g. `Jun 05 04:25:40.658 INFO  (server:726) hashi http listening on :8080`.
+  ## The default callback: one formatted line to stderr per record, e.g.
+  ## `Jun 05 04:25:40.658 INFO  (server:640) hashi http listening on 127.0.0.1:8080 (fd=5)`.
   var s = ""
   addTimestamp(s)
   s.add ' '

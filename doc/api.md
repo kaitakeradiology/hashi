@@ -80,9 +80,11 @@ make them `O_NONBLOCK` and pass them to `waitRead`/`waitWrite`.
 
 `serve(port)` starts the loop and blocks. Register everything before
 calling it. `serve(port, config)` sets a `ServerConfig` first; `bindAddr`
-is an address literal (`""` or `"::"` for dual-stack, `"0.0.0.0"` for IPv4
-only, `"127.0.0.1"` for loopback). A listen failure prints one line to
-stderr and exits 1.
+is an address literal: `""`, the default, listens on 127.0.0.1 and ::1
+(loopback only; 127.0.0.1 alone, with a warning, without IPv6 loopback),
+`"::"` on every interface dual-stack, `"0.0.0.0"` on every IPv4 interface,
+and any other literal on that address. Each bound address is logged. A
+listen failure prints one line to stderr and exits 1.
 
 **Routes.** `get`, `post`, `put`, `delete`, `head`, `options`, `patch` and
 `addRoute` register a `Handler` on the process-global router. Matching is

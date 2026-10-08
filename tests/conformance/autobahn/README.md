@@ -39,17 +39,20 @@ unshare -Urm sh -c "mount --rbind /proc $R/proc && mount --rbind /dev $R/dev &&
 
 ```bash
 ../nimony/bin/nimony c examples/ws_echo.nim        # build
-$(find nimcache -name ws_echo -type f | head -1)    # run — listens on 0.0.0.0:8080
+$(find nimcache -name ws_echo -type f | head -1)    # run — listens on 127.0.0.1:8080 and [::1]:8080
 ```
 
-It binds all interfaces, so it can be reached from another host.
+It listens on loopback only, which is what the same-host run below needs. To
+reach it from another host, pass the bind address: `ws_echo ::` listens on
+every interface.
 
 ## 3. Point the suite at the server
 
 `fuzzingclient.json` defaults to `ws://127.0.0.1:8080` — correct when the
 server and the container run on the **same** host (the runner uses
 `--network host`). If the server is on a different box (e.g. hashi on the dev
-box, podman elsewhere), set the `url` to `ws://<server-ip>:8080`.
+box, podman elsewhere), start it as `ws_echo ::` and set the `url` to
+`ws://<server-ip>:8080`.
 
 ## 4. Run
 

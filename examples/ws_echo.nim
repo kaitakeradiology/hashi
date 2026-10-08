@@ -4,7 +4,11 @@
 ##
 ## `import hashi` brings in `setWsHandler`, the `WsConn` type and the passive
 ## `wsRecv`/`wsSend` ops.
+##
+## Listens on port 8080 of the bind address given as the first argument,
+## else on loopback only: `ws_echo ::` serves every interface.
 
+import std/cmdline
 import hashi
 
 proc onWs(ws: WsConn) {.passive.} =
@@ -18,4 +22,4 @@ proc onWs(ws: WsConn) {.passive.} =
         ws.open = false
 
 setWsHandler(onWs)
-serve(8080'u16)
+serve(8080'u16, bindAddr = (if paramCount() >= 1: paramStr(1) else: ""))

@@ -8,8 +8,26 @@ notes.
 
 ## [Unreleased]
 
+### Added
+
+- `listenLoopbackPair` (`hashi/net`): listen on 127.0.0.1 and ::1 on one
+  port. ::1 missing (`EADDRNOTAVAIL`, `EAFNOSUPPORT`) leaves 127.0.0.1
+  open for the caller to warn; any other ::1 failure closes 127.0.0.1.
+
 ### Changed
 
+- **Upgrade note:** an empty bind address now means loopback only, where
+  it meant every interface. `serve` and `addWsListener` with `bindAddr`
+  `""`, the default, listen on 127.0.0.1 and ::1 (127.0.0.1 alone, with a
+  warning, on a host without IPv6 loopback), and `tryListenTcp` with `""`
+  binds 127.0.0.1. A server reached from another host stops being
+  reachable: callers that passed `""` or nothing for every interface now
+  pass `"::"` (dual-stack) or `"0.0.0.0"` (IPv4). `"::"`, `"::0"`,
+  `"0.0.0.0"` and other literals are unchanged. `serve` logs every bound
+  address, an IPv6 one in brackets (`[::1]:8080`), and names the address
+  in a listen failure.
+- `examples/ws_echo` takes the bind address as its first argument and
+  listens on loopback without one; `ws_echo ::` serves every interface.
 - CI is pinned to Nimony `1f232868`, was `564d789e`: the older pin predates
   nim-lang/nimony#2588, which sizes `std/threadpool` from the CPU affinity
   and no longer pins workers, so a server confined to a CPU subset (a

@@ -160,7 +160,7 @@ proc addWsListener*(port: uint16; handler: WsHandler; bindAddr = ""): bool =
   ## reachable on it (a non-WebSocket request gets 426), so a separate port
   ## or interface is its own trust domain. Call before `serve`. Returns false
   ## once `MaxExtraListeners` are registered. `bindAddr` takes the same
-  ## literals as `serve`.
+  ## literals as `serve`: "" (the default) listens on 127.0.0.1 and ::1 only.
   if gExtra.len >= MaxExtraListeners: return false
   gExtra.add Listener(port: port, bindAddr: bindAddr, handler: handler)
   result = true
@@ -593,8 +593,9 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
 # ── listeners and the loop ──────────────────────────────────────────────
 
 proc acceptLoop(listenFd: cint; extraIdx: int) {.passive.} =
-  ## Accept on a listener and spawn `handleConn` per connection; `extraIdx`
-  ## is -1 for the main listener.
+  ## Accept on one listening fd and spawn `handleConn` per connection;
+  ## `extraIdx` is -1 for the main listener. A listener on "" has two fds,
+  ## each with its own loop and the same `extraIdx`.
   while true:
     let fd = waitAccept(listenFd)
     if fd >= 0:
@@ -630,17 +631,44 @@ proc reaperLoop() {.passive.} =
     sleepMs(interval)
     discard reapExpired(getMonoTime().ticks)
 
-proc listenOrQuit(port: uint16; bindAddr, what: string): cint =
-  ## A listening fd for `port`, or a message on stderr and exit 1. Written
-  ## synchronously: the log may not have flushed by `quit`.
-  let lr = tryListenTcp(port, bindAddr = bindAddr)
-  if not lr.ok:
-    writeLine(stderr, "hashi http: cannot listen — " & listenError(lr, port))
-    quit(1)
-  let shown = if bindAddr.len > 0: bindAddr else: "::"
-  log(info, "hashi http" & what & " listening on " & shown & ":" & $port.int &
-            " (fd=" & $lr.fd.int & ")")
-  result = lr.fd
+proc hostPort(address: string; port: uint16): string =
+  ## `address`:`port` for an operator, an IPv6 address in brackets.
+  if find(address, ':') >= 0: result = "[" & address & "]:" & $port.int
+  else: result = address & ":" & $port.int
+
+proc listening(what, at: string; fd: cint) =
+  log(info, "hashi http" & what & " listening on " & at & " (fd=" & $fd.int & ")")
+
+proc cannotListen(what, at: string; r: ListenResult; port: uint16) =
+  ## Exit 1 with the failure on stderr, written synchronously: the log may
+  ## not have flushed by `quit`.
+  writeLine(stderr, "hashi http" & what & ": cannot listen on " & at & " — " &
+                    listenError(r, port))
+  quit(1)
+
+proc listenOrQuit(port: uint16; bindAddr, what: string): seq[cint] =
+  ## The listening fds for `port`, each bound address logged: one fd for an
+  ## address literal; for "", 127.0.0.1 and ::1, or 127.0.0.1 alone with a
+  ## warning when the host has no IPv6 loopback. Any other failure exits 1.
+  result = @[]
+  if bindAddr.len == 0:
+    let p = listenLoopbackPair(port)
+    if not p.v4.ok:
+      if p.v4.stage.len > 0: cannotListen(what, hostPort("127.0.0.1", port), p.v4, port)
+      else: cannotListen(what, hostPort("::1", port), p.v6, port)
+    result.add p.v4.fd
+    listening(what, hostPort("127.0.0.1", port), p.v4.fd)
+    if p.v6.ok:
+      result.add p.v6.fd
+      listening(what, hostPort("::1", port), p.v6.fd)
+    else:
+      log(warn, "hashi http" & what & ": no IPv6 loopback, listening on 127.0.0.1 only — " &
+                listenError(p.v6, port))
+  else:
+    let lr = tryListenTcp(port, bindAddr = bindAddr)
+    if not lr.ok: cannotListen(what, hostPort(bindAddr, port), lr, port)
+    result.add lr.fd
+    listening(what, hostPort(bindAddr, port), lr.fd)
 
 proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
   ## Serve HTTP/1.1 on `port`: start the loop and block, dispatching each
@@ -649,9 +677,12 @@ proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
   ## and socket options (default: whatever `setServerConfig` installed, else
   ## the built-in defaults).
   ##
-  ## `bindAddr` is an address literal, never a hostname: "" or "::" for the
-  ## dual-stack wildcard, "0.0.0.0" for IPv4 only, or a specific address such
-  ## as "127.0.0.1" for loopback only. See `tryListenTcp`.
+  ## `bindAddr` is an address literal, never a hostname. "" (the default)
+  ## listens on 127.0.0.1 and ::1, so the server is reachable from this host
+  ## only; without IPv6 loopback it warns and listens on 127.0.0.1 alone.
+  ## "::" is every interface, dual-stack; "0.0.0.0" every IPv4 interface;
+  ## any other literal, such as "192.0.2.10", that address alone. See
+  ## `tryListenTcp` and `listenLoopbackPair`. Every bound address is logged.
   ##
   ## A config `validateServerConfig` rejects, or a `setTrustedProxies` entry
   ## `trustedProxyFaults` reports, is logged at error level and the process
@@ -669,11 +700,15 @@ proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
   setLingerCap((if nofile > 0: min(MaxFds, nofile) else: MaxFds) div 4)
   ignoreSigpipe()
   initLoop()
-  let listenFd = listenOrQuit(port, bindAddr, "")
-  spawnTask acceptLoop(listenFd, -1)
+  let mainFds = listenOrQuit(port, bindAddr, "")
+  for i in 0 ..< mainFds.len:
+    let fd = mainFds[i]
+    spawnTask acceptLoop(fd, -1)
   for e in 0 ..< gExtra.len:
-    let efd = listenOrQuit(gExtra[e].port, gExtra[e].bindAddr, " (ws-only)")
-    spawnTask acceptLoop(efd, e)
+    let extraFds = listenOrQuit(gExtra[e].port, gExtra[e].bindAddr, " (ws-only)")
+    for i in 0 ..< extraFds.len:
+      let fd = extraFds[i]
+      spawnTask acceptLoop(fd, e)
   if hasBootTask(): spawnTask bootRunner()
   if gServerConfig.idleTimeoutMs > 0 or gServerConfig.wsIdleTimeoutMs > 0:
     log(info, "hashi http: idle reaper on (idle=" & $gServerConfig.idleTimeoutMs &
