@@ -14,7 +14,7 @@
 
 from std/posix/posix import close, fcntl, F_GETFL, F_SETFL, O_NONBLOCK,
   AF_INET, AF_INET6, SOCK_STREAM, IPPROTO_TCP, IPPROTO_IPV6, SOL_SOCKET,
-  SO_REUSEADDR, Sockaddr_in, SockLen, EADDRNOTAVAIL, EAFNOSUPPORT
+  SO_REUSEADDR, Sockaddr_in, SockLen, EADDRNOTAVAIL, EAFNOSUPPORT, errno
 import std/strutils
 
 # Socket calls and types `std/posix` does not declare yet.
@@ -86,8 +86,6 @@ type
 proc getrlimit(resource: cint; rlim: ptr RLimit): cint {.
   importc, header: "<sys/resource.h>".}
 
-var errno {.importc: "errno", header: "<errno.h>".}: cint
-
 const EADDRINUSE* = 98.cint   ## Linux `errno`: address already in use.
 
 type
@@ -145,7 +143,7 @@ proc tryListenTcp*(port: uint16; backlog = 4096; bindAddr = ""): ListenResult =
   if not v6:
     fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
   if fd < 0:
-    result.err = errno
+    result.err = errno()
     result.stage = "socket"
     return
   var yes: cint = 1
@@ -160,12 +158,12 @@ proc tryListenTcp*(port: uint16; backlog = 4096; bindAddr = ""): ListenResult =
   else:
     bound = bindSocket(fd, cast[ptr CSockAddr](addr a4), SockLen(sizeof(a4))).cint
   if bound != 0:
-    result.err = errno
+    result.err = errno()
     result.stage = "bind"
     discard close(fd)
     return
   if listenSocket(fd, backlog.cint) != 0:
-    result.err = errno
+    result.err = errno()
     result.stage = "listen"
     discard close(fd)
     return
@@ -205,7 +203,7 @@ proc listenLoopbackPair*(port: uint16; backlog = 4096): LoopbackPair =
   var got = default(Sockaddr_in)
   var gotLen = SockLen(sizeof(got))
   if getsockname(result.v4.fd, cast[ptr CSockAddr](addr got), addr gotLen) != 0:
-    let e = errno
+    let e = errno()
     discard close(result.v4.fd)
     result.v4 = ListenResult(ok: false, fd: -1, err: e, stage: "getsockname")
     return

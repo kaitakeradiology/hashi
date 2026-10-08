@@ -1,6 +1,7 @@
 ## Unit tests for `hashi/log`: the level filter, the callback, and the
 ## default stderr line.
 
+{.feature: "assumeSync".}   # single-threaded: the test's own state, never touched by a worker
 import std/[syncio, strutils]
 import hashi/log
 import testkit
@@ -23,7 +24,7 @@ proc capture(level: LogLevel; file: string; line: int; msg: string) {.nimcall.} 
   got.add((level, file, line, msg))
 
 setLogCallback(capture)
-logLevel = LogLevel.info
+setLogLevel(LogLevel.info)
 
 log(LogLevel.debug, costly())
 check built == 0, "a filtered call never evaluates its message"
@@ -46,10 +47,10 @@ else:
 
 section "log — the level threshold is inclusive"
 
-logLevel = LogLevel.error
+setLogLevel(LogLevel.error)
 log(LogLevel.warn, "dropped")
 log(LogLevel.error, "kept")
-check got.len == 2 and got[1][3] == "kept", "only records at or above logLevel pass"
+check got.len == 2 and got[1][3] == "kept", "only records at or above the level pass"
 
 section "stderrLog — the default line"
 

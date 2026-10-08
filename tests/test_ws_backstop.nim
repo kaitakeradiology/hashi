@@ -14,7 +14,7 @@
 ## a silent peer that stops reading, while the reader's keepalive PING waits
 ## behind the stalled writer, is shut down by the backstop the PING arms, at
 ## the idle timeout plus the close grace.
-import std/[syncio, monotimes]
+import std/[syncio, monotimes, atomics]
 from std/posix/posix import close, write, pcall, SockLen, Sockaddr_storage
 import hashi/loop
 import hashi/net
@@ -57,7 +57,7 @@ proc clientPing(): string =
     result.add char(0)
     k = k + 1
 
-var gDone = false
+var gDone = false        # all four: accessed atomically
 var gEndMs = 0'i64
 var gStreamDone = false
 var gSent = 0
@@ -67,10 +67,10 @@ proc streamTask(ws: WsConn) {.passive.} =
   var going = true
   while going:
     let ok = wsSend(ws, payload, true)
-    if ok: gSent = gSent + 1
+    if ok: atomicInc(gSent)
     else: going = false
     if not ws.open: going = false
-  gStreamDone = true
+  atomicStore(gStreamDone, true, moRelease)
 
 proc serveOne(fd: cint) {.passive.} =
   let ws = newWsConn(fd, "")
@@ -79,13 +79,13 @@ proc serveOne(fd: cint) {.passive.} =
   while running:
     let m = wsRecv(ws)
     if m.kind == wmClose: running = false
-  gEndMs = nowMs()
+  atomicStore(gEndMs, nowMs(), moRelease)
   ws.open = false
-  while not gStreamDone: sleepMs(5)
+  while not atomicLoad(gStreamDone, moAcquire): sleepMs(5)
   subInflight(ws.acc.len)
   clearConn(fd)
   closeFd(fd)
-  gDone = true
+  atomicStore(gDone, true, moRelease)
 
 type Outcome = object
   done: bool
@@ -104,10 +104,10 @@ proc runPair(userTimeoutMs: int; peerPings: bool): Outcome =
   cfg.wsPingIntervalMs = PingMs
   cfg.reapIntervalMs = ReapMs
   setServerConfig(cfg)
-  gDone = false
-  gEndMs = 0
-  gStreamDone = false
-  gSent = 0
+  atomicStore(gDone, false, moRelease)
+  atomicStore(gEndMs, 0'i64, moRelease)
+  atomicStore(gStreamDone, false, moRelease)
+  atomicStore(gSent, 0, moRelease)
   let lr = tryListenTcp(0'u16, bindAddr = "127.0.0.1")
   if not lr.ok:
     echo "  listen failed"; quit(1)
@@ -153,11 +153,11 @@ proc runPair(userTimeoutMs: int; peerPings: bool): Outcome =
     if now - lastReap >= ReapMs:
       discard reapExpired(getMonoTime().ticks)
       lastReap = now
-    if parks3s < 0 and (gDone or now - t0 >= 3000):
+    if parks3s < 0 and (atomicLoad(gDone, moAcquire) or now - t0 >= 3000):
       parks3s = wsGuardParksTotal() - parks0
-    if gDone or now - t0 >= 10_000: going = false
+    if atomicLoad(gDone, moAcquire) or now - t0 >= 10_000: going = false
   discard close(peer)
-  result = Outcome(done: gDone, took: gEndMs - t0, parks3s: parks3s, sent: gSent,
+  result = Outcome(done: atomicLoad(gDone, moAcquire), took: atomicLoad(gEndMs, moAcquire) - t0, parks3s: parks3s, sent: atomicLoad(gSent, moAcquire),
                    armedEarly: armedEarly)
 
 discard cAlarm(40.cuint)

@@ -6,6 +6,7 @@
 ## warning. Guards against the 2026-07-23 spoof regression where a forged
 ## XFF first entry was trusted.
 
+{.feature: "assumeSync".}   # single-threaded: the warning capture is only called from this thread
 import std/[syncio, strutils]
 import hashi/net
 import hashi/http/request

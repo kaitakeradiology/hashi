@@ -37,9 +37,10 @@ import hashi/net
 import hashi/http/request
 import hashi/http/httplog
 import hashi/log
+import hashi/bootcfg
 
-var gTrustedProxies: seq[string] = @[]
-var gTrustedFaults = ""
+var gTrustedProxies: Frozen[seq[string]]
+var gTrustedFaults: Frozen[string]
 
 proc isMulticastOrUnspecified(c: string): bool =
   ## Whether canonical address text `c` (`parseIpLiteral`'s output) is
@@ -79,16 +80,16 @@ proc setTrustedProxies*(proxies: seq[string]) =
         faults.add "\"" & sanitizePrintable(e, 64) & "\" is " & why
       else:
         list.add c
-  gTrustedProxies = list
-  gTrustedFaults = faults
+  publish(gTrustedProxies, list)
+  publish(gTrustedFaults, faults)
 
 proc trustedProxyFaults*(): string =
   ## The entries the last `setTrustedProxies` refused, with the reason for
   ## each, or "" when it refused none.
-  gTrustedFaults
+  snapshot(gTrustedFaults)
 
 proc isTrustedCanonical(c: string): bool =
-  c.len > 0 and c in gTrustedProxies
+  c.len > 0 and c in view(gTrustedProxies)[]
 
 proc isTrustedProxy*(peer: string): bool =
   ## Whether forwarded headers from the socket `peer` are honoured. For any

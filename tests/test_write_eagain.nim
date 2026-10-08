@@ -103,7 +103,7 @@ proc freePort(): uint16 =
         result = cNtohs(got.sin_port)
     discard cClose(fd)
 
-var gPort = 0'u16
+let gPort = freePort()
 
 proc dial(): cint =
   ## A blocking client socket connected to the server.
@@ -329,7 +329,7 @@ proc wsScenario() {.passive.} =
   check f.opcode == opBinary and f.payload.len == WsBody,
         "message is " & $f.payload.len & " of " & $WsBody & " bytes"
 
-var gServerFlags = -1   ## the accepted socket's `fcntl(F_GETFL)`, from `/flags`
+var gServerFlags = -1   ## accessed atomically: the accepted socket's `fcntl(F_GETFL)`, from `/flags`
 
 proc acceptedFlags(): int =
   ## `F_GETFL` of a connected socket whose local port is the server's: the
@@ -353,8 +353,8 @@ proc modeScenario() {.passive.} =
   discard writeAll(c.fd, "GET /flags HTTP/1.1\r\nHost: localhost\r\n\r\n")
   readBody(c)
   discard cClose(c.fd)
-  check gServerFlags >= 0, "found the accepted socket"
-  check (gServerFlags and int(ONonblock)) != 0, "accepted sockets are O_NONBLOCK"
+  check atomicLoad(gServerFlags) >= 0, "found the accepted socket"
+  check (atomicLoad(gServerFlags) and int(ONonblock)) != 0, "accepted sockets are O_NONBLOCK"
 
 proc pipeScenario() =
   section "readNow, writeNow and writevNow on a pipe"
@@ -513,7 +513,7 @@ proc mid(req: Request): Response {.nimcall, raises.} =
   newResponse(200, filled(MidBody, 'x'))
 
 proc flagsRoute(req: Request): Response {.nimcall, raises.} =
-  gServerFlags = acceptedFlags()
+  atomicStore(gServerFlags, acceptedFlags())
   newResponse(200, "ok")
 
 proc onWs(ws: WsConn) {.passive.} =
@@ -521,7 +521,6 @@ proc onWs(ws: WsConn) {.passive.} =
   discard wsSend(ws, filled(WsBody, 'y'), true)
 
 discard cAlarm(120)
-gPort = freePort()
 if gPort == 0'u16:
   writeLine(stderr, "test_write_eagain: no free loopback port")
   quit(1)

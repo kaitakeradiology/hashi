@@ -28,11 +28,32 @@ notes.
   in a listen failure.
 - `examples/ws_echo` takes the bind address as its first argument and
   listens on loopback without one; `ws_echo ::` serves every interface.
+- Ported to Nimony's restricted globals (nim-lang/nimony#2609): a routine may
+  touch a mutable module-level `var` only through a `.sync` routine. Build
+  hashi with a Nimony that has `.sync` and `assumeSync`.
+  - Boot-time registrations (routes, middleware, passive handlers, the boot
+    task, `addWsListener`, `setWsHandler`, `setSseHandler`, `setServerConfig`,
+    `setTrustedProxies`, `setAllowedOrigins`) are sealed when `serve` starts.
+    One made afterwards writes `FATAL hashi: boot config changed after
+    serve()` to stderr and aborts the process, where it used to race the
+    workers. Register before `serve`.
+  - `serve`'s `config` default is `serverConfig()`, a copy of what
+    `setServerConfig` installed.
+  - `initLoop` relies on `initPool` and `initIoRing` being idempotent.
+
 - CI is pinned to Nimony `1f232868`, was `564d789e`: the older pin predates
   nim-lang/nimony#2588, which sizes `std/threadpool` from the CPU affinity
   and no longer pins workers, so a server confined to a CPU subset (a
   container cpuset) spawned one worker per host CPU and stalled. Build hashi
   with Nimony `1f232868` or later.
+
+### Removed
+
+- Upgrade note: the exported variables `logLevel`, `gServerConfig`,
+  `gWsHandler` and `gSseHandler` are gone. Use `setLogLevel(level)` and
+  `logEnabled(level)` (`hashi/log`), `serverConfig()` (`hashi/http/config`),
+  `wsHandler()` (`hashi/ws/session`) and `sseHandler()` (`hashi/sse/session`).
+  `logLevel = error` becomes `setLogLevel(error)`.
 
 ## [0.1.6] - 2026-10-06
 

@@ -12,7 +12,7 @@
 ## workers are stopped first and the main thread runs every task and polls
 ## the only lane in use. One connection receives a message every 10 ms (one
 ## timed poll each); a second stays silent, its poll the long-lived entry.
-import std/[syncio, monotimes]
+import std/[syncio, monotimes, atomics]
 from std/posix/posix import close, write, pcall
 import hashi/loop
 import hashi/net
@@ -51,7 +51,7 @@ proc clientFrame(op: Opcode; payload: string): string =
 proc peerWrite(fd: cint; s: string) =
   discard pcall(write(fd, readRawData(s, 0), s.len))
 
-var gDone = 0
+var gDone = 0   # both: accessed atomically
 var gMsgs = 0
 
 proc serveOne(fd: cint) {.passive.} =
@@ -60,11 +60,11 @@ proc serveOne(fd: cint) {.passive.} =
   while running:
     let m = wsRecv(ws)
     if m.kind == wmClose: running = false
-    else: gMsgs = gMsgs + 1
+    else: atomicInc(gMsgs)
   subInflight(ws.acc.len)
   clearConn(fd)
   closeFd(fd)
-  gDone = gDone + 1
+  atomicInc(gDone)
 
 proc heapLen(lane: int): int = gTimers[lane].len
 
@@ -104,8 +104,8 @@ proc runLoad(name: string; ping, idle: int) =
   cfg.wsKeepalivePollMs = CapMs
   setServerConfig(cfg)
   let lane = ioLane()
-  gDone = 0
-  gMsgs = 0
+  atomicStore(gDone, 0, moRelease)
+  atomicStore(gMsgs, 0, moRelease)
   let busy = newPair()
   let quiet = newPair()
   spawnTask serveOne(quiet[0])
@@ -126,7 +126,7 @@ proc runLoad(name: string; ping, idle: int) =
     if h > maxHeap: maxHeap = h
     if now - t0 >= 2 * CapMs: going = false
   let loadMs = nowMs() - t0
-  let measured = gMsgs * 1000 div int(loadMs)
+  let measured = atomicLoad(gMsgs, moAcquire) * 1000 div int(loadMs)
   # One more window with no load: every stale entry has expired by then.
   let t1 = nowMs()
   while nowMs() - t1 < CapMs + 200:
@@ -134,7 +134,7 @@ proc runLoad(name: string; ping, idle: int) =
   let after = heapLen(lane)
   let live = liveEntries(lane, false)
   let timers = liveEntries(lane, true)
-  let conns = 2 - gDone
+  let conns = 2 - atomicLoad(gDone, moAcquire)
   section name
   echo "  ", measured, " polls/s; heap max ", maxHeap,
        " (bound ", Rate * CapMs * 3 div 2000, "); after the load: ", after,
@@ -150,9 +150,9 @@ proc runLoad(name: string; ping, idle: int) =
   peerWrite(busy[1], clientFrame(opClose, closeFrameBody(1000)))
   peerWrite(quiet[1], clientFrame(opClose, closeFrameBody(1000)))
   let t2 = nowMs()
-  while gDone < 2 and nowMs() - t2 < 3000:
+  while atomicLoad(gDone, moAcquire) < 2 and nowMs() - t2 < 3000:
     workTurn()
-  check gDone == 2, "both connections closed"
+  check atomicLoad(gDone, moAcquire) == 2, "both connections closed"
   discard close(busy[1])
   discard close(quiet[1])
 

@@ -40,14 +40,10 @@ when defined(posix):
 else:
   import std/windows/winlean
 
-var gLoopUp = false
-
 proc initLoop*() =
   ## Bring up the worker pool and the I/O ring. Idempotent.
-  if gLoopUp: return
   initPool()
   initIoRing()
-  gLoopUp = true
 
 proc pumpIo*(timeoutMs = 0): bool {.discardable.} =
   ## Run the calling thread's share of completions, waiting up to

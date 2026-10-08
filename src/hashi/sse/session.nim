@@ -13,6 +13,7 @@
 ## connection until it returns.
 
 import hashi/http/request
+import hashi/bootcfg
 
 type
   SseHandler* = proc(req: Request; fd: cint) {.passive.}
@@ -23,20 +24,26 @@ type
   SseMatch* = proc(req: Request): bool {.nimcall.}
     ## Predicate selecting the requests served as SSE streams.
 
-var gSseHandler*: nil SseHandler   ## nil until `setSseHandler`.
-var gSseMatch: nil SseMatch
+var gSseHandler: Frozen[nil SseHandler]   # unset until `setSseHandler`
+var gSseMatch: Frozen[nil SseMatch]
 
 proc setSseHandler*(match: SseMatch; h: SseHandler) =
   ## Register the match predicate and the handler. Call before `serve`. There
   ## is one handler; an app with several SSE endpoints dispatches inside it.
-  gSseMatch = match
-  gSseHandler = h
+  publish(gSseMatch, match)
+  publish(gSseHandler, h)
 
 proc hasSseHandler*(): bool =
   ## True once `setSseHandler` has been called.
-  result = gSseHandler != nil
+  result = snapshot(gSseHandler) != nil
 
 proc sseMatches*(req: Request): bool =
   ## Whether `req` should be served by the registered SSE handler. False when
   ## none is registered.
-  result = gSseMatch != nil and gSseMatch(req)
+  let match = snapshot(gSseMatch)
+  result = match != nil and match(req)
+
+proc sseHandler*(): nil SseHandler =
+  ## The registered handler, nil until `setSseHandler`. For the connection
+  ## driver.
+  snapshot(gSseHandler)

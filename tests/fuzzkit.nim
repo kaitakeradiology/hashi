@@ -2,6 +2,8 @@
 ## failure reproduces from the seed in the fuzzer's header, and the byte and
 ## token shapes the parsers are fed.
 
+{.feature: "assumeSync".}   # single-threaded: one seeded generator, no worker ever calls it
+
 import std/random
 import std/strutils
 

@@ -148,7 +148,7 @@ block:
   var c = defaultServerConfig()
   c.maxBodySize = 123
   setServerConfig(c)
-  check gServerConfig.maxBodySize == 123, "setServerConfig updates the global"
+  check serverConfig().maxBodySize == 123, "setServerConfig updates the global"
   setServerConfig(defaultServerConfig())   # restore for any later use
 
 # ── parseFrame honours maxPayload ─────────────────────────────────────────

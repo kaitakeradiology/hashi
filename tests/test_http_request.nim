@@ -9,6 +9,7 @@
 ## the psOk cases fail until the parser is implemented — that's the point
 ## (TDD: red before green).
 
+{.feature: "assumeSync".}   # single-threaded: the test's own state, never touched by a worker
 import std/[syncio, strutils, uri]
 import hashi/http/request
 import hashi/http/router

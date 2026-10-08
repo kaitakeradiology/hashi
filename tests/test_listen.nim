@@ -12,11 +12,11 @@
 ## ::1, and a connection to one of the host's non-loopback addresses is
 ## refused.
 
-import std/[syncio, strutils]
+import std/[syncio, strutils, atomics]
 import hashi
 import hashi/net
 import hashi/buffer
-from std/posix/posix import close, SockLen
+from std/posix/posix import close, SockLen, errno
 import testkit
 
 proc cSocket(domain, typ, protocol: cint): cint {.importc: "socket", header: "<sys/socket.h>".}
@@ -32,7 +32,6 @@ proc cInetNtop(af: cint; src: pointer; dst: cstring; size: SockLen): cstring {.
 proc cFcntl(fd: cint; cmd: cint; arg: cint): cint {.importc: "fcntl", header: "<fcntl.h>".}
 proc cAlarm(seconds: cuint): cuint {.importc: "alarm", header: "<unistd.h>".}
   ## The watchdog: a server run that never answers fails instead of hanging.
-var cErrno {.importc: "errno", header: "<errno.h>".}: cint
 
 const
   AfInet = 2.cint
@@ -151,8 +150,11 @@ section "listenTcp — bindAddr address-literal convention"
 var bp = 29520'u16
 
 proc bindCase(ba: string): ListenResult =
-  bp = bp + 1'u16
-  result = tryListenTcp(bp, 128, ba)
+  var port = 0'u16
+  {.cast(assumeSync).}:   # main thread only, and before serve starts any worker
+    bp = bp + 1'u16
+    port = bp
+  result = tryListenTcp(port, 128, ba)
   if result.ok: discard close(result.fd)
 
 let bDual = bindCase("::")
@@ -262,9 +264,9 @@ proc dialTo(text: string; port: uint16): cint =
   let len = sockaddrFor(text, port, sa)
   if len == SockLen(0): return -1
   let fd = cSocket(familyOf(sa), SockStream, 0.cint)
-  if fd < 0: return -cErrno
+  if fd < 0: return -errno()
   if cConnect(fd, addr sa, len) != 0:
-    result = -cErrno
+    result = -errno()
     discard close(fd)
   else:
     discard cFcntl(fd, FSetfl, cFcntl(fd, FGetfl, 0.cint) or ONonblock)
@@ -315,8 +317,10 @@ proc freePort(): uint16 =
   result = if r.ok: portOf(r.fd) else: 0'u16
   closeOk(r)
 
-var gMain = 0'u16
-var gWs = 0'u16
+var gMain = 0   # written before serve, read by runServe on a worker
+var gWs = 0
+template ld(v: untyped): untyped = atomicLoad(v, moAcquire)
+template st(v, x: untyped) = atomicStore(v, x, moRelease)
 
 proc notReachable(fam, probe: string) =
   ## A non-loopback address of this host on family `fam` refuses both
@@ -325,18 +329,18 @@ proc notReachable(fam, probe: string) =
   if a.len == 0 or a == "127.0.0.1" or a == "::1":
     echo "   note: no non-loopback " & fam & " address, skipped"
   else:
-    check refused(a, gMain), "main listener refuses " & a
-    check refused(a, gWs), "ws-only listener refuses " & a
+    check refused(a, uint16(ld(gMain))), "main listener refuses " & a
+    check refused(a, uint16(ld(gWs))), "ws-only listener refuses " & a
 
 proc runServe() {.passive.} =
   section "serve and addWsListener with \"\" — loopback only"
-  check startsWith(exchange("127.0.0.1", gMain), "HTTP/1.1 200"),
+  check startsWith(exchange("127.0.0.1", uint16(ld(gMain))), "HTTP/1.1 200"),
         "main listener answers on 127.0.0.1"
-  check startsWith(exchange("::1", gMain), "HTTP/1.1 200"),
+  check startsWith(exchange("::1", uint16(ld(gMain))), "HTTP/1.1 200"),
         "main listener answers on ::1"
-  check startsWith(exchange("127.0.0.1", gWs), "HTTP/1.1 426"),
+  check startsWith(exchange("127.0.0.1", uint16(ld(gWs))), "HTTP/1.1 426"),
         "ws-only listener answers on 127.0.0.1"
-  check startsWith(exchange("::1", gWs), "HTTP/1.1 426"),
+  check startsWith(exchange("::1", uint16(ld(gWs))), "HTTP/1.1 426"),
         "ws-only listener answers on ::1"
   notReachable("IPv4", "192.0.2.1")
   notReachable("IPv6", "2001:db8::1")
@@ -349,14 +353,16 @@ proc wsOnly(ws: WsConn) {.passive.} =
   discard wsRecv(ws)
 
 discard cAlarm(30)
-gMain = freePort()
-gWs = freePort()
-if gMain == 0'u16 or gWs == 0'u16 or gMain == gWs:
+let mainPort = freePort()
+let wsPort = freePort()
+st(gMain, int(mainPort))
+st(gWs, int(wsPort))
+if mainPort == 0'u16 or wsPort == 0'u16 or mainPort == wsPort:
   writeLine(stderr, "test_listen: no free loopback ports")
   quit(1)
 get("/ok", ok)
-if not addWsListener(gWs, wsOnly):
+if not addWsListener(wsPort, wsOnly):
   writeLine(stderr, "test_listen: no WebSocket-only listener")
   quit(1)
 setBootTask(runServe)
-serve(gMain)
+serve(mainPort)

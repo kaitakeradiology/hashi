@@ -22,7 +22,7 @@
 ## how long the server lingers against a trickling, a silent and a flooding
 ## client, and that the cap on lingering connections holds.
 import std/[syncio, strutils, opt, monotimes, times, atomics]
-from std/posix/posix import Sockaddr_in, SockLen
+from std/posix/posix import Sockaddr_in, SockLen, errno
 import hashi
 import hashi/buffer
 import hashi/http/connreg
@@ -44,7 +44,6 @@ proc cHtons(x: uint16): uint16 {.importc: "htons", header: "<arpa/inet.h>".}
 proc cNtohs(x: uint16): uint16 {.importc: "ntohs", header: "<arpa/inet.h>".}
 proc cHtonl(x: uint32): uint32 {.importc: "htonl", header: "<arpa/inet.h>".}
 proc cWrite(fd: cint; buf: pointer; n: csize_t): int {.importc: "write", header: "<unistd.h>".}
-var cErrno {.importc: "errno", header: "<errno.h>".}: cint
 const EAGAIN = 11.cint
 const EINTR = 4.cint
 proc cAlarm(seconds: cuint): cuint {.importc: "alarm", header: "<unistd.h>".}
@@ -88,8 +87,8 @@ proc freePort(): uint16 =
         result = cNtohs(got.sin_port)
     discard cClose(fd)
 
-var gPort = 0'u16
-var gWsPort = 0'u16   ## the WebSocket-only listener
+let gPort = freePort()
+let gWsPort = freePort()   ## the WebSocket-only listener
 
 proc dial(port: uint16): cint =
   ## A non-blocking client socket connected to the server on `port`. Loopback connects
@@ -182,8 +181,8 @@ proc writeOnce(c: Client; s: string; off: int): int =
   copyOut(addr c.wbuf[0], s, off, n)
   let r = cWrite(c.fd, addr c.wbuf[0], csize_t(n))
   result = if r >= 0: int(r)
-           elif cErrno == EAGAIN or cErrno == EINTR: 0
-           else: -int(cErrno)
+           elif errno() == EAGAIN or errno() == EINTR: 0
+           else: -int(errno())
 
 proc sendAll(c: Client; s: string) {.passive.} =
   ## Write all of `s` with plain write(2), keeping the first failure's -errno
@@ -593,17 +592,17 @@ proc silentClient() {.passive.} =
   discard cClose(c.fd)
   settled("after the silent client", start, lstart)
 
-var gFloodFd: cint = -1
+var gFloodFd: cint = -1   # accessed atomically
 var gFloodStop: int
 var gFloodDone: int
-var gFloodBuf: array[16384, byte]
 
 proc floodOnce(): int =
-  ## One write(2) of `gFloodBuf`: 1 when bytes went, 0 when the socket
+  ## One write(2) of 16 KiB of zeros: 1 when bytes went, 0 when the socket
   ## buffer is full, -1 once the connection is gone.
-  let r = cWrite(gFloodFd, addr gFloodBuf[0], csize_t(gFloodBuf.len))
+  var buf = default(array[16384, byte])
+  let r = cWrite(atomicLoad(gFloodFd), addr buf[0], csize_t(buf.len))
   result = if r > 0: 1
-           elif r < 0 and (cErrno == EAGAIN or cErrno == EINTR): 0
+           elif r < 0 and (errno() == EAGAIN or errno() == EINTR): 0
            else: -1
 
 proc flooder() {.passive.} =
@@ -628,7 +627,7 @@ proc floodingClient() {.passive.} =
   let head = readHead(c)
   let t0 = getMonoTime()
   check statusOf(head) == 413, "answered 413"
-  gFloodFd = c.fd
+  atomicStore(gFloodFd, c.fd)
   atomicStore(gFloodStop, 0)
   atomicStore(gFloodDone, 0)
   spawnTask flooder()
@@ -713,8 +712,10 @@ proc lingerCapHolds() {.passive.} =
 
 proc lingerEqualsIdle() {.passive.} =
   section "linger: lingerMs equal to lingerIdleMs ends at the bound"
-  let savedMs = gServerConfig.lingerMs
-  gServerConfig.lingerMs = LingerIdleMs
+  # Written in place: `setServerConfig` aborts once `serve` has sealed the boot config.
+  let live = serverConfigView()
+  let savedMs = live[].lingerMs
+  live[].lingerMs = LingerIdleMs
   let start = inflightBytes()
   let lstart = lingeringNow()
   let closed0 = lingerClosedTotal()
@@ -734,7 +735,7 @@ proc lingerEqualsIdle() {.passive.} =
   check ended >= 0 and ended <= LingerIdleMs + Slack,
         "ended by lingerMs + slack (ended at " & $ended & " ms)"
   discard cClose(c.fd)
-  gServerConfig.lingerMs = savedMs
+  live[].lingerMs = savedMs
   settled("after the bound", start, lstart)
 
 proc lingeringRefusals() {.passive.} =
@@ -882,8 +883,6 @@ proc denyGate(req: Request): Opt[Response] {.nimcall.} =
   else: result = none[Response]()
 
 discard cAlarm(90)
-gPort = freePort()
-gWsPort = freePort()
 if gPort == 0'u16 or gWsPort == 0'u16 or gPort == gWsPort:
   writeLine(stderr, "test_inflight: no free loopback ports")
   quit(1)

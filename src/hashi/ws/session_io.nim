@@ -283,10 +283,10 @@ proc keepaliveWaitMs(ws: WsConn; now: int64): int =
   ## How long a parked read may wait before its next keepalive step:
   ## the nearer of the next PING and the idle timeout, at most
   ## `MaxKeepalivePollMs`; -1 (no deadline) when both are off.
-  let ping = gServerConfig.wsPingIntervalMs
-  let idle = gServerConfig.wsIdleTimeoutMs
+  let ping = serverConfigView()[].wsPingIntervalMs
+  let idle = serverConfigView()[].wsIdleTimeoutMs
   if ping <= 0 and idle <= 0: return -1
-  var cap = gServerConfig.wsKeepalivePollMs
+  var cap = serverConfigView()[].wsKeepalivePollMs
   if cap <= 0 or cap > MaxKeepalivePollMs: cap = MaxKeepalivePollMs
   result = cap
   if ping > 0:
@@ -296,8 +296,8 @@ proc keepaliveWaitMs(ws: WsConn; now: int64): int =
 
 proc keepaliveStep(ws: WsConn; now: int64): KeepaliveStep =
   ## What a timed-out wait owes: the idle close first, then a PING.
-  let ping = gServerConfig.wsPingIntervalMs
-  let idle = gServerConfig.wsIdleTimeoutMs
+  let ping = serverConfigView()[].wsPingIntervalMs
+  let idle = serverConfigView()[].wsIdleTimeoutMs
   if idle > 0 and msLeft(ws.lastInbound, idle, now) <= 0:
     result = ksIdle
   elif ping > 0 and msLeft(max(ws.lastInbound, ws.lastPingSent), ping, now) <= 0:
@@ -318,8 +318,8 @@ proc armWriteBackstop(ws: WsConn): bool =
   ## a deadline is already armed. True when it armed one, which the caller
   ## disarms once the write returns.
   result = false
-  let idle = gServerConfig.wsIdleTimeoutMs
-  if idle > 0 and gServerConfig.userTimeoutMs <= 0 and not ws.hasOutq and
+  let idle = serverConfigView()[].wsIdleTimeoutMs
+  if idle > 0 and serverConfigView()[].userTimeoutMs <= 0 and not ws.hasOutq and
      deadlineOf(ws.fd) == 0'i64:
     let graceNs = int64(WsCloseGraceMs) * 1_000_000'i64
     let idleNs = min(int64(idle), 1_000_000_000'i64) * 1_000_000'i64
@@ -417,7 +417,7 @@ proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
   var done = false
   while not done:
     var f = default(Frame)
-    let pr = parseFrame(ws.acc, 0, f, gServerConfig.maxWsPayload)
+    let pr = parseFrame(ws.acc, 0, f, serverConfigView()[].maxWsPayload)
     if pr[0] == psIncomplete:
       var n = 0
       if blocking: n = awaitInbound(ws)
@@ -447,7 +447,7 @@ proc recvMessage(ws: WsConn; blocking: bool): WsMessage {.passive.} =
       # after this; `f` itself is not touched again.
       wsConsume(ws, pr[1])
       let before = assembledLen(ws.st)
-      let act = handleFrame(ws.st, f, gServerConfig.maxWsMessage)
+      let act = handleFrame(ws.st, f, serverConfigView()[].maxWsMessage)
       countAssembled(ws, before)
       if act.kind == waPong:
         if not readerEmit(ws, serializeFrame(opPong, act.payload), lnUrgent, true):

@@ -1,6 +1,7 @@
 ## Unit tests for `hashi/buffer`: bulk append, drop and copy across the
 ## string's inline and heap representations.
 
+{.feature: "assumeSync".}   # single-threaded: the test's own state, never touched by a worker
 import std/[syncio, strutils]
 import hashi/buffer
 import testkit

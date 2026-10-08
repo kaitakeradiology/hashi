@@ -23,7 +23,7 @@
 ## `.output` + `--overwrite` infra (a Nim `tester.nim`) and fold `check` into
 ## it — until then this stays.
 
-import std/[syncio, envvars, terminal]
+import std/[syncio, envvars, terminal, ticketlocks]
 
 # Colour iff stdout is a terminal and NO_COLOR is unset (https://no-color.org),
 # decided once at load.
@@ -37,6 +37,9 @@ proc paint(s: string; fg: ForegroundColor; bright = false; bold = false): string
   result.add s
   result.add ansiStyleCode(0)
 
+var hkLock: TicketLock
+  ## Guards the tallies below: scenarios running on pool workers call `check`.
+
 var
   hkPassed = 0
   hkFailed = 0
@@ -45,48 +48,58 @@ var
   hkSection = ""
 
 proc rollUp() =
-  ## Emit the just-finished section's tally (green if clean, red if any failed).
-  if hkSection.len == 0: return
-  let total = hkSecPassed + hkSecFailed
-  if hkSecFailed == 0:
-    echo "   ", paint("✓ " & $hkSecPassed & "/" & $total, fgGreen),
-         " ", paint(hkSection, fgBlack, bright = true)
-  else:
-    echo "   ", paint("✗ " & $hkSecPassed & "/" & $total & " (" &
-         $hkSecFailed & " failed)", fgRed, bold = true), " ", paint(hkSection, fgBlack, bright = true)
+  ## Caller holds `hkLock`. Emit the just-finished section's tally (green if clean, red if any failed).
+  {.cast(assumeSync).}:   # caller holds hkLock
+    if hkSection.len == 0: return
+    let total = hkSecPassed + hkSecFailed
+    if hkSecFailed == 0:
+      echo "   ", paint("✓ " & $hkSecPassed & "/" & $total, fgGreen),
+           " ", paint(hkSection, fgBlack, bright = true)
+    else:
+      echo "   ", paint("✗ " & $hkSecPassed & "/" & $total & " (" &
+           $hkSecFailed & " failed)", fgRed, bold = true), " ", paint(hkSection, fgBlack, bright = true)
 
 proc section*(name: string) =
   ## Start a named group: roll up the previous one, then print a header. Checks
   ## that follow are tallied under it and printed live as they run.
-  rollUp()
-  hkSecPassed = 0
-  hkSecFailed = 0
-  hkSection = name
-  echo ""
-  echo paint("── " & name, fgCyan, bold = true)
+  acquire(hkLock)
+  {.cast(assumeSync).}:   # under hkLock
+    rollUp()
+    hkSecPassed = 0
+    hkSecFailed = 0
+    hkSection = name
+    echo ""
+    echo paint("── " & name, fgCyan, bold = true)
+  release(hkLock)
 
-template check*(cond: bool; msg: string) =
+proc check*(cond: bool; msg: string) =
   ## Record + print one assertion live. Keeps going on failure so one run
   ## reports every failing case, not just the first.
-  if cond:
-    hkPassed = hkPassed + 1
-    hkSecPassed = hkSecPassed + 1
-    echo "  ", paint("✓", fgGreen), " ", msg
-  else:
-    hkFailed = hkFailed + 1
-    hkSecFailed = hkSecFailed + 1
-    echo "  ", paint("✗ FAIL", fgRed, bold = true), " ", paint(msg, fgRed, bright = true)
+  acquire(hkLock)
+  {.cast(assumeSync).}:   # under hkLock
+    if cond:
+      hkPassed = hkPassed + 1
+      hkSecPassed = hkSecPassed + 1
+      echo "  ", paint("✓", fgGreen), " ", msg
+    else:
+      hkFailed = hkFailed + 1
+      hkSecFailed = hkSecFailed + 1
+      echo "  ", paint("✗ FAIL", fgRed, bold = true), " ", paint(msg, fgRed, bright = true)
+  release(hkLock)
 
 proc finish*() {.noreturn.} =
   ## Roll up the last section, print the overall tally, and exit: 0 if every
   ## check passed, 1 if any failed (the runner treats non-zero as failure).
-  rollUp()
-  echo ""
-  let total = hkPassed + hkFailed
-  if hkFailed > 0:
-    echo paint("✗ " & $hkFailed & " failed", fgRed, bold = true),
-         ", ", $hkPassed, " passed of ", $total
-    quit(1)
-  else:
-    echo paint("✓ all " & $total & " passed", fgGreen, bold = true)
-    quit(0)
+  var failed = 0
+  acquire(hkLock)
+  {.cast(assumeSync).}:   # under hkLock; the process exits below
+    rollUp()
+    echo ""
+    let total = hkPassed + hkFailed
+    failed = hkFailed
+    if hkFailed > 0:
+      echo paint("✗ " & $hkFailed & " failed", fgRed, bold = true),
+           ", ", $hkPassed, " passed of ", $total
+    else:
+      echo paint("✓ all " & $total & " passed", fgGreen, bold = true)
+  quit(if failed > 0: 1 else: 0)

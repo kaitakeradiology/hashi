@@ -14,7 +14,7 @@
 ## Each scenario runs one connection over a socketpair: the server half
 ## wrapped in a `WsConn` and driven on the pool, the client half played by
 ## the main thread with hashi's own frame parser.
-import std/[syncio, monotimes]
+import std/[syncio, monotimes, atomics]
 from std/posix/posix import close, read, write, pcall
 import hashi/loop
 import hashi/net        # ignoreSigpipe
@@ -86,7 +86,9 @@ type
     eofAtMs: int64          ## when the read side hit EOF; 0 until then
     dataAfterClose: int     ## data frames that followed a CLOSE on the wire
 
-var gReadBuf = default(array[65536, char])
+template ld(v: untyped): untyped = atomicLoad(v, moAcquire)
+template st(v, x: untyped) = atomicStore(v, x, moRelease)
+
 
 proc checkBig(f: Frame): bool =
   ## Scenario (g)'s payload: byte j is j mod 251.
@@ -102,13 +104,14 @@ proc pump(p: var Peer; mode: PeerMode) =
   ## Read what the server sent and parse every complete frame. Reads at
   ## most 1 MiB per call, so a server that writes as fast as the peer reads
   ## cannot keep the main thread from its own worker turns.
-  let cap = if mode == pmSlowReader: 16384 else: gReadBuf.len
+  var readBuf = default(array[65536, char])   # main thread only
+  let cap = if mode == pmSlowReader: 16384 else: readBuf.len
   var budget = 1024 * 1024
   var more = true
   while more:
-    let n = pcall(read(p.fd, addr gReadBuf[0], cap))
+    let n = pcall(read(p.fd, addr readBuf[0], cap))
     if n > 0:
-      appendBytes(p.acc, addr gReadBuf[0], int(n))
+      appendBytes(p.acc, addr readBuf[0], int(n))
       budget = budget - int(n)
       if mode == pmSlowReader or budget <= 0: more = false
     else:
@@ -183,15 +186,15 @@ proc streamTask(ws: WsConn; big, steady: bool) {.passive.} =
   var going = true
   while going:
     let ok = wsSend(ws, payload, true)
-    if ok: gStreamed = gStreamed + 1
+    if ok: atomicInc(gStreamed)
     else:
-      gSendFalseMs = nowMs()
+      st(gSendFalseMs, nowMs())
       going = false
     if not steady:
       let nap = if big: 10 else: 5
       sleepMs(nap)
-    if not gStubborn and not ws.open: going = false
-  gStreamDone = true
+    if not ld(gStubborn) and not ws.open: going = false
+  st(gStreamDone, true)
 
 proc drainQueue(ws: WsConn; q: OutQueue) {.passive.} =
   ## Queued mode's teardown: run the writer until the queue drains.
@@ -209,10 +212,10 @@ proc rawStreamTask(ws: WsConn) {.passive.} =
   while going:
     let ok = wsWriteAll(ws, frame)
     if not ok:
-      gRawFalseMs = nowMs()
+      st(gRawFalseMs, nowMs())
       going = false
-    if not gStubborn and not ws.open: going = false
-  gRawDone = true
+    if not ld(gStubborn) and not ws.open: going = false
+  st(gRawDone, true)
 
 proc serveOne(fd: cint; queued, stream, big, steady, dual, closeOnText: bool) {.passive.} =
   ## The driver-shaped task: one connection, the handler's `wsRecv` loop,
@@ -221,38 +224,39 @@ proc serveOne(fd: cint; queued, stream, big, steady, dual, closeOnText: bool) {.
   let q = newOutQueue()
   if queued: useOutQueue(ws, q)
   if stream:
-    gStreamDone = false
+    st(gStreamDone, false)
     spawnTask streamTask(ws, big, steady)
   if dual:
-    gRawDone = false
+    st(gRawDone, false)
     spawnTask rawStreamTask(ws)
   var running = true
   while running:
     let m = wsRecv(ws)
     if m.kind == wmClose:
-      gKind = m.kind.int
-      gOpen = ws.open
-      gEndMs = nowMs()
+      st(gKind, m.kind.int)
+      st(gOpen, ws.open)
+      st(gEndMs, nowMs())
       running = false
     elif closeOnText:
-      gKind = m.kind.int
+      st(gKind, m.kind.int)
       discard wsClose(ws, 1000)
-      gEndMs = nowMs()
+      st(gEndMs, nowMs())
       running = false
     else:
-      gMsgs = gMsgs + 1
-      gLastMsg = m.data
+      atomicInc(gMsgs)
+      {.cast(assumeSync).}:   # written only here, read by the main thread after ld(gDone)
+        gLastMsg = m.data
   ws.open = false
-  while not gStreamDone: sleepMs(5)
-  while not gRawDone: sleepMs(5)
+  while not ld(gStreamDone): sleepMs(5)
+  while not ld(gRawDone): sleepMs(5)
   if queued:
-    gUrgent = queuedCount(q, lnUrgent)
-    gControl = queuedCount(q, lnControl)
+    st(gUrgent, queuedCount(q, lnUrgent))
+    st(gControl, queuedCount(q, lnControl))
     drainQueue(ws, q)
   subInflight(ws.acc.len)
   clearConn(fd)
   closeFd(fd)
-  gDone = true
+  st(gDone, true)
 
 # ── one scenario ────────────────────────────────────────────────────────
 
@@ -274,12 +278,14 @@ proc start(p: var Peer; ping, idle: int; queued = false; stream = false;
   p = Peer(fd: sv[1], acc: "", pings: 0, pongs: 0, closes: 0, data: 0, bad: 0,
            closeCode: 0, pongPayload: "", dataOk: true, firstOps: @[],
            closeAtMs: 0, eofAtMs: 0, dataAfterClose: 0)
-  gDone = false; gKind = -1; gOpen = true; gMsgs = 0; gEndMs = 0; gLastMsg = ""
-  gStreamed = 0; gUrgent = -1; gControl = -1
+  st(gDone, false); st(gKind, -1); st(gOpen, true); st(gMsgs, 0); st(gEndMs, 0'i64)
+  {.cast(assumeSync).}:   # no task of the previous scenario is running
+    gLastMsg = ""
+  st(gStreamed, 0); st(gUrgent, -1); st(gControl, -1)
   result = nowMs()
-  gStubborn = stubborn
-  gSendFalseMs = 0
-  gRawFalseMs = 0
+  st(gStubborn, stubborn)
+  st(gSendFalseMs, 0)
+  st(gRawFalseMs, 0)
   spawnTask serveOne(sv[0], queued, stream, big, steady, dual, closeOnText)
 
 proc drive(p: var Peer; mode: PeerMode; forMs: int; untilDone: bool) =
@@ -299,7 +305,7 @@ proc drive(p: var Peer; mode: PeerMode; forMs: int; untilDone: bool) =
     if now - lastReap >= 20:
       discard reapExpired(getMonoTime().ticks)
       lastReap = now
-    if untilDone and gDone: going = false
+    if untilDone and ld(gDone): going = false
     if now - t0 >= forMs: going = false
   pump(p, mode)
 
@@ -324,10 +330,10 @@ block:
   let t0 = start(p, 50, 200)
   drive(p, pmSilent, 3000, true)
   discard close(p.fd)
-  let took = gEndMs - t0
-  check gDone, "the handler returned"
-  check gKind == wmClose.int, "wsRecv returned wmClose"
-  check not gOpen, "the connection is marked closed"
+  let took = ld(gEndMs) - t0
+  check ld(gDone), "the handler returned"
+  check ld(gKind) == wmClose.int, "wsRecv returned wmClose"
+  check not ld(gOpen), "the connection is marked closed"
   check p.pings >= 2 and p.pings <= 4, "the peer saw 2-4 pings, not a flood (saw " & $p.pings & ")"
   check p.closes == 1 and p.closeCode == 1001, "the peer got CLOSE 1001 (code " & $p.closeCode & ")"
   check took >= 150 and took < 1000, "closed at the idle timeout (" & $took & " ms)"
@@ -339,11 +345,11 @@ block:
   var p = default(Peer)
   discard start(p, 50, 200)
   drive(p, pmAnswerPings, 700, false)
-  check not gDone, "still open after 3x the idle timeout"
+  check not ld(gDone), "still open after 3x the idle timeout"
   check p.pings >= 3, "pinged and answered (" & $p.pings & " pings)"
   check p.closes == 0, "no CLOSE sent"
   finishPeer(p, pmAnswerPings)
-  check gDone and gKind == wmClose.int, "the client's close ends it"
+  check ld(gDone) and ld(gKind) == wmClose.int, "the client's close ends it"
   check p.closes == 1 and p.closeCode == 1000, "the close was echoed"
 
 section "(c) a peer sending data stays open"
@@ -351,11 +357,11 @@ block:
   var p = default(Peer)
   discard start(p, 50, 200)
   drive(p, pmSendData, 700, false)
-  check not gDone, "still open after 3x the idle timeout"
-  check gMsgs >= 3, "the handler got the messages (" & $gMsgs & ")"
+  check not ld(gDone), "still open after 3x the idle timeout"
+  check ld(gMsgs) >= 3, "the handler got the messages (" & $ld(gMsgs) & ")"
   check p.closes == 0, "no CLOSE sent"
   finishPeer(p, pmSendData)
-  check gDone, "the client's close ends it"
+  check ld(gDone), "the client's close ends it"
 
 section "(d) streaming to a silent peer still closes at idle"
 block:
@@ -364,9 +370,9 @@ block:
   let t0 = start(p, 50, 200, stream = true)
   drive(p, pmSilent, 3000, true)
   discard close(p.fd)
-  let took = gEndMs - t0
-  check gDone, "the handler returned"
-  check gKind == wmClose.int, "wsRecv returned wmClose"
+  let took = ld(gEndMs) - t0
+  check ld(gDone), "the handler returned"
+  check ld(gKind) == wmClose.int, "wsRecv returned wmClose"
   check p.data >= 5, "the stream was flowing (" & $p.data & " frames)"
   check took >= 150 and took < 1000, "closed at the idle timeout (" & $took & " ms)"
   check wsIdleClosedTotal() == idle0 + 1, "counted as a WebSocket idle close"
@@ -379,7 +385,7 @@ block:
   let t0 = start(p, 0, 200)
   drive(p, pmSilent, 3000, true)
   discard close(p.fd)
-  let took = gEndMs - t0
+  let took = ld(gEndMs) - t0
   check p.pings == 0, "ping 0: no pings (" & $p.pings & ")"
   check p.closes == 1 and p.closeCode == 1001, "ping 0: still closed with 1001 at idle"
   check took >= 150 and took < 1000, "ping 0: closed at the idle timeout (" & $took & " ms)"
@@ -388,19 +394,19 @@ block:
   var p = default(Peer)
   discard start(p, 50, 0)
   drive(p, pmSilent, 1000, false)
-  check not gDone, "idle 0: a silent peer is never closed"
+  check not ld(gDone), "idle 0: a silent peer is never closed"
   check p.pings >= 10 and p.pings <= 25, "idle 0: pings keep coming, about one per interval (" & $p.pings & ")"
   check p.closes == 0, "idle 0: no CLOSE"
   finishPeer(p, pmSilent)
-  check gDone, "idle 0: the client's close ends it"
+  check ld(gDone), "idle 0: the client's close ends it"
 block:
   var p = default(Peer)
   discard start(p, 0, 0)
   drive(p, pmSilent, 1000, false)
-  check not gDone, "both 0: never closed"
+  check not ld(gDone), "both 0: never closed"
   check p.pings == 0 and p.closes == 0, "both 0: nothing sent"
   finishPeer(p, pmSilent)
-  check gDone, "both 0: the client's close ends it"
+  check ld(gDone), "both 0: the client's close ends it"
 
 section "(f) direct mode: a pong and then the app's close"
 block:
@@ -409,11 +415,11 @@ block:
   peerWrite(p.fd, clientFrame(opPing, "hi") & clientFrame(opText, "bye"))
   drive(p, pmSilent, 3000, true)
   discard close(p.fd)
-  check gDone, "the handler returned (no deadlock)"
-  check gKind == wmText.int, "the handler got the text"
+  check ld(gDone), "the handler returned (no deadlock)"
+  check ld(gKind) == wmText.int, "the handler got the text"
   check p.pongs == 1 and p.pongPayload == "hi", "the ping was answered"
   check p.closes == 1 and p.closeCode == 1000, "the app's close went out"
-  check gEndMs - t0 < 150, "both writes went out at once"
+  check ld(gEndMs) - t0 < 150, "both writes went out at once"
 
 section "(g) direct mode: pings never land inside a streamed frame"
 block:
@@ -425,7 +431,7 @@ block:
   peerWrite(p.fd, clientFrame(opClose, closeFrameBody(1000)))
   drive(p, pmSlowReader, 5000, true)
   discard close(p.fd)
-  check gDone, "the handler returned"
+  check ld(gDone), "the handler returned"
   check p.bad == 0, "every frame the peer received parsed"
   check p.dataOk, "every data frame arrived whole and in order"
 
@@ -436,14 +442,14 @@ block:
   peerWrite(p.fd, clientFrame(opPing, "p1"))
   drive(p, pmSilent, 3000, true)
   discard close(p.fd)
-  check gDone, "the handler returned"
-  check gUrgent == 1, "the PONG was still queued at close (" & $gUrgent & ")"
-  check gControl >= 3, "pings and the CLOSE queued behind it (" & $gControl & ")"
+  check ld(gDone), "the handler returned"
+  check ld(gUrgent) == 1, "the PONG was still queued at close (" & $ld(gUrgent) & ")"
+  check ld(gControl) >= 3, "pings and the CLOSE queued behind it (" & $ld(gControl) & ")"
   check p.pongs == 1 and p.pongPayload == "p1", "the PONG reached the peer"
   check p.pings >= 2, "so did the pings (" & $p.pings & ")"
   check p.closes == 1 and p.closeCode == 1001, "and the CLOSE 1001"
   check p.firstOps.len > 0 and p.firstOps[0] == opPong, "the PONG went first"
-  check gEndMs - t0 >= 150, "closed at the idle timeout"
+  check ld(gEndMs) - t0 >= 150, "closed at the idle timeout"
 
 section "(i) no ping while the peer is part-way through a frame"
 block:
@@ -453,15 +459,18 @@ block:
   peerWrite(p.fd, substr(whole, 0, 8))          # the header and 3 payload bytes
   drive(p, pmSilent, 250, false)
   check p.pings == 0, "no ping during a 250 ms pause mid-frame (" & $p.pings & ")"
-  check not gDone, "still open"
+  check not ld(gDone), "still open"
   let before = p.pings
   peerWrite(p.fd, substr(whole, 9))
   drive(p, pmSilent, 200, false)
-  check gMsgs == 1 and gLastMsg == "hello, keepalive", "the message arrived intact"
+  var lastMsg = ""
+  {.cast(assumeSync).}:   # the handler has returned (ld(gDone) above)
+    lastMsg = gLastMsg
+  check ld(gMsgs) == 1 and lastMsg == "hello, keepalive", "the message arrived intact"
   check p.pings - before >= 2, "pings resumed once the frame was complete (" & $(p.pings - before) & ")"
   check p.bad == 0, "every frame parsed"
   finishPeer(p, pmSilent)
-  check gDone, "the client's close ends it"
+  check ld(gDone), "the client's close ends it"
 block:
   var p = default(Peer)
   let idle0 = wsIdleClosedTotal()
@@ -469,8 +478,8 @@ block:
   peerWrite(p.fd, substr(clientFrame(opText, "never finished"), 0, 8))
   drive(p, pmSilent, 3000, true)
   discard close(p.fd)
-  let took = gEndMs - t0
-  check gDone and gKind == wmClose.int, "a peer stalled mid-frame is closed"
+  let took = ld(gEndMs) - t0
+  check ld(gDone) and ld(gKind) == wmClose.int, "a peer stalled mid-frame is closed"
   check p.pings == 0, "and never pinged (" & $p.pings & ")"
   check p.closes == 1 and p.closeCode == 1001, "with CLOSE 1001"
   check took >= 350 and took < 1500, "at the idle timeout (" & $took & " ms)"
@@ -483,7 +492,7 @@ block:
   drive(p, pmAnswerPings, 1000, false)
   check p.pings >= 3, "at least 3 pings in 1 s while the writer streams (" & $p.pings & ")"
   drive(p, pmAnswerPings, 300, false)
-  check not gDone, "still open at 3x the idle timeout"
+  check not ld(gDone), "still open at 3x the idle timeout"
   check p.closes == 0, "no CLOSE sent"
   check p.data >= 10, "the stream kept flowing (" & $p.data & " frames)"
   check p.bad == 0, "every frame parsed"
@@ -492,7 +501,7 @@ block:
   finishPeer(p, pmAnswerPings)
   echo "  close handshake: handler done after ", nowMs() - tc, " ms, ",
        wsGuardParksTotal() - parks0, " guard parks"
-  check gDone, "the client's close ends it"
+  check ld(gDone), "the client's close ends it"
   check p.closes == 1 and p.closeCode == 1000, "the close was echoed"
   check p.dataAfterClose == 0, "no data frame followed the CLOSE"
 
@@ -509,7 +518,7 @@ block:
   check p.closes == 1 and p.closeCode == 1001, "a CLOSE 1001 arrived (code " & $p.closeCode & ")"
   check p.closeAtMs > 0 and closeAt >= 350 and closeAt < 1500, "at about the idle timeout (" & $closeAt & " ms)"
   check p.eofAtMs > 0 and p.closeAtMs > 0 and p.closeAtMs <= p.eofAtMs, "before the EOF (" & $eofAt & " ms)"
-  check gDone and eofAt <= 400 + WsCloseGraceMs + 500, "torn down within idle + the close grace"
+  check ld(gDone) and eofAt <= 400 + WsCloseGraceMs + 500, "torn down within idle + the close grace"
   check wsIdleClosedTotal() == idle0 + 1, "counted as a WebSocket idle close"
   check p.bad == 0, "every frame parsed"
   check p.dataAfterClose == 0, "no data frame followed the CLOSE"
@@ -525,14 +534,14 @@ block:
   drive(p, pmSilent, 200, false)
   discard close(p.fd)
   let closeAt = p.closeAtMs - t0
-  let sendAt = gSendFalseMs - t0
-  let rawAt = gRawFalseMs - t0
-  check gDone, "the handler and both writers finished"
+  let sendAt = ld(gSendFalseMs) - t0
+  let rawAt = ld(gRawFalseMs) - t0
+  check ld(gDone), "the handler and both writers finished"
   check p.closes == 1 and p.closeCode == 1001, "a CLOSE 1001 arrived (code " & $p.closeCode & ")"
   check p.closeAtMs > 0 and closeAt < 1500, "at about the idle timeout (" & $closeAt & " ms)"
   check p.dataAfterClose == 0, "no data frame followed the CLOSE (" & $p.dataAfterClose & ")"
-  check gSendFalseMs > 0 and sendAt < 1500, "wsSend returned false at the CLOSE, not at the backstop (" & $sendAt & " ms)"
-  check gRawFalseMs > 0 and rawAt < 1500, "so did wsWriteAll (" & $rawAt & " ms)"
+  check ld(gSendFalseMs) > 0 and sendAt < 1500, "wsSend returned false at the CLOSE, not at the backstop (" & $sendAt & " ms)"
+  check ld(gRawFalseMs) > 0 and rawAt < 1500, "so did wsWriteAll (" & $rawAt & " ms)"
   check p.bad == 0, "every frame parsed"
 
 section "teardown"

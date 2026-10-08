@@ -14,6 +14,7 @@
 import hashi/http/request
 import hashi/ws/frame
 import hashi/ws/protocol
+import hashi/bootcfg
 
 type
   ServerConfig* = object
@@ -140,9 +141,21 @@ proc validateServerConfig*(c: ServerConfig): string =
     result = "lingerIdleMs (" & $c.lingerIdleMs & ") must not exceed lingerMs (" &
              $c.lingerMs & ")"
 
-var gServerConfig* = defaultServerConfig()
+var gServerConfig: Frozen[ServerConfig]
   ## The active config. Set before `serve`; read-only during serving.
 
+publish(gServerConfig, defaultServerConfig())
+
 proc setServerConfig*(c: ServerConfig) =
-  ## Replace the active server config. Call before `serve`.
-  gServerConfig = c
+  ## Replace the active server config. Call before `serve`; once `serve` has
+  ## started, a call aborts the process.
+  publish(gServerConfig, c)
+
+proc serverConfig*(): ServerConfig =
+  ## A copy of the active config.
+  snapshot(gServerConfig)
+
+proc serverConfigView*(): ptr ServerConfig =
+  ## The active config in place, for the connection driver's per-request reads.
+  ## Read through it; never write.
+  view(gServerConfig)

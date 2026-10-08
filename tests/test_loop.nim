@@ -20,21 +20,25 @@ proc cAlarm(seconds: cuint): cuint {.importc: "alarm", header: "<unistd.h>".}
 const AfUnix = 1.cint
 const SockStream = 1.cint
 
-var gGot = -999
-var gBuf = default(array[64, char])
-var gDone = false
+var gGot = -999        # accessed atomically
+var gBuf = default(array[64, char])   # written by `reader` before gDone's release store; read after its acquire load
+var gDone = false      # accessed atomically
 
 proc reader(fd: cint) {.passive.} =
   ## Cross-module by-name passive call that PARKS in the ring.
-  gGot = waitRead(fd, addr gBuf[0], 64)
-  gDone = true
+  var lbuf = default(array[64, char])
+  let n = waitRead(fd, addr lbuf[0], 64)
+  {.cast(assumeSync).}:   # gBuf: see its declaration
+    gBuf = lbuf
+  atomicStore(gGot, n, moRelaxed)
+  atomicStore(gDone, true, moRelease)
 
-var gNapDone = false
+var gNapDone = false   # accessed atomically
 
 proc napper() {.passive.} =
   ## Parks on a ring timer, so a caller that waits for it waits 200 ms.
   sleepMs(200)
-  gNapDone = true
+  atomicStore(gNapDone, true, moRelease)
 
 proc spawnReturnsAtOnce() =
   ## `spawnTask` starts the task and returns; it does not wait for the task to
@@ -44,12 +48,12 @@ proc spawnReturnsAtOnce() =
   spawnTask napper()
   let spentMs = (getMonoTime().ticks - t0) div 1_000_000
   var spins = 0
-  while not gNapDone and spins < 200:
+  while not atomicLoad(gNapDone, moAcquire) and spins < 200:
     discard pumpIo(10)
     spins = spins + 1
   section "spawnTask returns while the task is parked"
   check spentMs < 100, "spawnTask returned in " & $spentMs & " ms (the task parks for 200)"
-  check gNapDone, "the spawned task still ran to the end"
+  check atomicLoad(gNapDone, moAcquire), "the spawned task still ran to the end"
 
 var gBlocked: int     # accessed atomically: workers held by `blocker`
 var gRelease: bool    # accessed atomically
@@ -188,10 +192,11 @@ proc main() =
       echo "  socketpair failed"; quit(1)
     setNonBlocking(sv[0])
     setNonBlocking(sv[1])
-    gGot = -999
-    gDone = false
-    var z = 0
-    while z < 64: gBuf[z] = '\0'; z = z + 1
+    atomicStore(gGot, -999, moRelaxed)
+    atomicStore(gDone, false, moRelease)
+    {.cast(assumeSync).}:   # no task is running: the previous iteration's reader finished
+      var z = 0
+      while z < 64: gBuf[z] = '\0'; z = z + 1
 
     spawnTask reader(sv[0])
     discard pumpIo(10)               # let the reader submit its op on this lane
@@ -203,15 +208,17 @@ proc main() =
     discard write(sv[1], addr mbuf[0], msg.len)
 
     var spins = 0
-    while not gDone and spins < 400:
+    while not atomicLoad(gDone, moAcquire) and spins < 400:
       discard pumpIo(10)
       spins = spins + 1
 
     var got = ""
+    let count = atomicLoad(gGot, moRelaxed)
     var k = 0
-    while k < gGot and k < 64: got.add gBuf[k]; k = k + 1
-    if gGot == msg.len and got == msg: ok = ok + 1
-    else: echo "  iter ", i, ": count=", gGot, " (want ", msg.len, ") body=", got
+    {.cast(assumeSync).}:   # gBuf: read after gDone's acquire load
+      while k < count and k < 64: got.add gBuf[k]; k = k + 1
+    if count == msg.len and got == msg: ok = ok + 1
+    else: echo "  iter ", i, ": count=", count, " (want ", msg.len, ") body=", got
 
     discard close(sv[0])
     discard close(sv[1])

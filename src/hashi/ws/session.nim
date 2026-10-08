@@ -17,6 +17,7 @@ import std/[uri, strutils, monotimes]
 import hashi/ws/protocol
 import hashi/ws/outq
 import hashi/ws/outq_pacing
+import hashi/bootcfg
 
 type
   WsMsgKind* = enum
@@ -70,16 +71,15 @@ type
   WsHandler* = proc(ws: WsConn) {.passive.}
     ## App handler. Called once per upgraded connection; owns it until it returns.
 
-var gWsHandler*: nil WsHandler
-  ## The registered app handler; nil until `setWsHandler`.
+var gWsHandler: Frozen[nil WsHandler]   # unset until `setWsHandler`
 
 proc setWsHandler*(h: WsHandler) =
   ## Register the WebSocket handler. Call before `serve`.
-  gWsHandler = h
+  publish(gWsHandler, h)
 
 proc hasWsHandler*(): bool =
   ## True once `setWsHandler` has been called.
-  result = gWsHandler != nil
+  result = snapshot(gWsHandler) != nil
 
 proc newWsConn*(fd: cint; initial: string; clientIp = "";
                 cookie = ""; path = ""): WsConn =
@@ -115,22 +115,23 @@ proc useOutQueue*(ws: WsConn; q: OutQueue) =
   ws.hasOutq = true
   discard setWsSendBuf(ws.fd, q.pacingBytes)
 
-var gAllowedOrigins: seq[string] = @[]
+var gAllowedOrigins: Frozen[seq[string]]
   ## The WS-upgrade `Origin` allowlist, checked by the server before the 101
   ## response (see `originAllowed`).
 
 proc setAllowedOrigins*(origins: seq[string]) =
   ## Configure the WS-upgrade `Origin` allowlist. Call before `serve`.
-  gAllowedOrigins = origins
+  publish(gAllowedOrigins, origins)
 
 proc originAllowed*(origin: string): bool =
   ## A WS upgrade is allowed when it carries no `Origin` (a native, non-browser
   ## client — not a cross-site WebSocket-hijack vector) or an `Origin` on the
   ## allowlist. An empty allowlist therefore admits only no-Origin clients.
   if origin.len == 0: return true
+  let allowed = view(gAllowedOrigins)
   var i = 0
-  while i < gAllowedOrigins.len:
-    if gAllowedOrigins[i] == origin: return true
+  while i < allowed[].len:
+    if allowed[][i] == origin: return true
     i = i + 1
   result = false
 
@@ -148,3 +149,8 @@ proc originMatchesHost*(origin, host: string): bool =
     authority.add ':'
     authority.add u.port
   result = cmpIgnoreCase(authority, host) == 0
+
+proc wsHandler*(): nil WsHandler =
+  ## The registered handler, nil until `setWsHandler`. For the connection
+  ## driver.
+  snapshot(gWsHandler)

@@ -23,7 +23,7 @@ import hashi/sse/session      # setSseHandler
 import hashi/loop     # waitRead, waitWrite for handlers that own a socket
 ```
 
-Logging goes through `hashi/log`: `logLevel` filters, and `setLogCallback`
+Logging goes through `hashi/log`: `setLogLevel` filters, and `setLogCallback`
 routes records to the application's logger instead of stderr. The internals
 (`hashi/net`, the frame codec, the protocol state machine)
 are not re-exported by `hashi`; import them explicitly if you need them.

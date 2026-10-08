@@ -34,76 +34,79 @@ import hashi/ws/session
 import hashi/ws/session_io
 import hashi/sse/session
 import hashi/log
+import hashi/bootcfg
 import hashi/loop
 import hashi/buffer
 
 # ── registries ──────────────────────────────────────────────────────────
 
-var appRouter = default(Router)
+var appRouter: Frozen[Router]
   ## The process-global `Router` the connection driver dispatches through.
+
+proc routerView(): ptr Router = view(appRouter)
 
 proc addRoute*(meth, path: string; h: Handler) =
   ## Register `h` for `meth path`. See `hashi/http/router` for matching rules.
-  addRoute(appRouter, meth, path, h)
+  addRoute(edit(appRouter)[], meth, path, h)
 
 proc get*(path: string; h: Handler) =
   ## Register `h` for `GET path`.
-  get(appRouter, path, h)
+  get(edit(appRouter)[], path, h)
 
 proc post*(path: string; h: Handler) =
   ## Register `h` for `POST path`.
-  post(appRouter, path, h)
+  post(edit(appRouter)[], path, h)
 
 proc put*(path: string; h: Handler) =
   ## Register `h` for `PUT path`.
-  put(appRouter, path, h)
+  put(edit(appRouter)[], path, h)
 
 proc delete*(path: string; h: Handler) =
   ## Register `h` for `DELETE path`.
-  delete(appRouter, path, h)
+  delete(edit(appRouter)[], path, h)
 
 proc head*(path: string; h: Handler) =
   ## Register `h` for `HEAD path`. Without one, a GET route answers HEAD.
-  head(appRouter, path, h)
+  head(edit(appRouter)[], path, h)
 
 proc options*(path: string; h: Handler) =
   ## Register `h` for `OPTIONS path`.
-  options(appRouter, path, h)
+  options(edit(appRouter)[], path, h)
 
 proc patch*(path: string; h: Handler) =
   ## Register `h` for `PATCH path`.
-  patch(appRouter, path, h)
+  patch(edit(appRouter)[], path, h)
 
 proc setErrorHandler*(h: ErrorHandler) =
   ## Register the error handler: when a handler raises an `ErrorCode`, this
   ## maps it to the `Response` sent (default: `errorCodeToHttp`).
-  setErrorHandler(appRouter, h)
+  setErrorHandler(edit(appRouter)[], h)
 
 proc setNotFoundHandler*(h: Handler) =
   ## Register the fallback handler, invoked when no route matches. It is tried
   ## last regardless of registration order, unlike a greedy `get("/**", …)`
   ## route, which would shadow every route registered after it.
-  setNotFound(appRouter, h)
+  setNotFound(edit(appRouter)[], h)
 
 proc addBeforeMiddleware*(m: BeforeMiddleware) =
   ## Append a pre-dispatch middleware. See `hashi/http/router`. The chain
   ## runs for routes, SSE requests and WebSocket upgrades on the main
   ## listener, where a claim refuses the upgrade; it does not run on
   ## `addWsListener` listeners.
-  addBefore(appRouter, m)
+  addBefore(edit(appRouter)[], m)
 
 proc addAfterMiddleware*(m: AfterMiddleware) =
   ## Append a post-dispatch middleware, e.g. one that adds security headers.
-  addAfter(appRouter, m)
+  addAfter(edit(appRouter)[], m)
 
 proc setBeforeMiddleware*(m: seq[BeforeMiddleware]) =
   ## Replace the whole pre-dispatch chain. Its coverage is as for
   ## `addBeforeMiddleware`.
-  setBefore(appRouter, m)
+  setBefore(edit(appRouter)[], m)
 
 proc setAfterMiddleware*(m: seq[AfterMiddleware]) =
   ## Replace the whole post-dispatch chain.
-  setAfter(appRouter, m)
+  setAfter(edit(appRouter)[], m)
 
 type AsyncHandler* = proc (req: Request): Opt[Response] {.passive.}
   ## A request handler that may suspend on outbound I/O without blocking the
@@ -111,36 +114,36 @@ type AsyncHandler* = proc (req: Request): Opt[Response] {.passive.}
   ## before the synchronous routes: returning `some(resp)` claims the request,
   ## `none` falls through to route dispatch.
 
-var gAsync: seq[AsyncHandler] = @[]
+var gAsync: Frozen[seq[AsyncHandler]]
 
 proc addAsyncHandler*(h: AsyncHandler) =
   ## Append a passive handler to the chain. Handlers are tried in registration
   ## order and the first to return `some` claims the request. Call before
   ## `serve`.
-  gAsync.add h
+  edit(gAsync)[].add h
 
 proc hasAsyncHandler*(): bool =
-  result = gAsync.len > 0
+  result = view(gAsync)[].len > 0
 
 proc asyncHandlerCount*(): int =
   ## Number of registered passive handlers.
-  result = gAsync.len
+  result = view(gAsync)[].len
 
 type BootTask* = proc () {.passive.}
   ## A one-shot `.passive` task run on the reactor once the listener is up,
   ## for startup work that needs the reactor (see `setBootTask`).
-var gBootTask: nil BootTask
+var gBootTask: Frozen[nil BootTask]
 
 proc setBootTask*(t: BootTask) =
   ## Register a single `.passive` task to run once on the reactor right after the
   ## listener comes up. Replaces any prior task.
-  gBootTask = t
+  publish(gBootTask, t)
 
-proc hasBootTask*(): bool = gBootTask != nil
+proc hasBootTask*(): bool = snapshot(gBootTask) != nil
 
 proc bootRunner() {.passive.} =
   ## Drives the registered boot task; spawned by `serve` when one is set.
-  let t = gBootTask
+  let t = snapshot(gBootTask)
   if t != nil: t()
 
 const MaxExtraListeners* = 8
@@ -151,7 +154,7 @@ type Listener = object
   bindAddr: string
   handler: WsHandler
 
-var gExtra: seq[Listener] = @[]
+var gExtra: Frozen[seq[Listener]]
 
 proc addWsListener*(port: uint16; handler: WsHandler; bindAddr = ""): bool =
   ## Register an additional WebSocket-only listener on `port`/`bindAddr`, served
@@ -161,8 +164,9 @@ proc addWsListener*(port: uint16; handler: WsHandler; bindAddr = ""): bool =
   ## or interface is its own trust domain. Call before `serve`. Returns false
   ## once `MaxExtraListeners` are registered. `bindAddr` takes the same
   ## literals as `serve`: "" (the default) listens on 127.0.0.1 and ::1 only.
-  if gExtra.len >= MaxExtraListeners: return false
-  gExtra.add Listener(port: port, bindAddr: bindAddr, handler: handler)
+  let table = edit(gExtra)
+  if table[].len >= MaxExtraListeners: return false
+  table[].add Listener(port: port, bindAddr: bindAddr, handler: handler)
   result = true
 
 # ── the connection driver ───────────────────────────────────────────────
@@ -208,7 +212,7 @@ proc waitFill(c: Conn): int {.passive.} =
   ## are deliberately untimed: under TCP flow control a slow-but-alive reader
   ## is indistinguishable from a stalled one, and dead-peer detection on the
   ## write side is `TCP_USER_TIMEOUT`'s job (see `setKeepalive`).
-  let w = gServerConfig.idleTimeoutMs
+  let w = serverConfigView()[].idleTimeoutMs
   if w > 0: setDeadline(c.fd, getMonoTime().ticks + w.int64 * 1_000_000'i64)
   result = waitRead(c.fd, addr c.rbuf[0], c.rbuf.len)
   if w > 0: setDeadline(c.fd, 0'i64)
@@ -241,7 +245,7 @@ proc headNow(c: Conn): HeadOutcome =
   ## `maxRequestHead`: `c.acc` reaches the cap without one, or a complete
   ## head ends past it.
   clear(c.req)
-  let cap = gServerConfig.maxRequestHead
+  let cap = serverConfigView()[].maxRequestHead
   var st = parseRequestHead(c.acc, c.req)
   while st == psIncomplete and c.acc.len < cap:
     let n = fillNow(c)
@@ -280,7 +284,7 @@ proc bodyNow(c: Conn; need: var int): BodyOutcome =
   of bkNone:
     result = boOk
   of bkLength:
-    if bi.length > gServerConfig.maxBodySize: return boTooBig
+    if bi.length > serverConfigView()[].maxBodySize: return boTooBig
     need = c.req.headBytes + bi.length
     while c.acc.len < need:
       let n = fillNow(c)
@@ -295,7 +299,7 @@ proc bodyNow(c: Conn; need: var int): BodyOutcome =
     var pos = c.bodyPos
     var done = false
     while not done:
-      let cr = decodeChunked(c.acc, pos, c.req.body, gServerConfig.maxBodySize)
+      let cr = decodeChunked(c.acc, pos, c.req.body, serverConfigView()[].maxBodySize)
       if cr[0] == psOk:
         need = pos + cr[1]
         result = boOk
@@ -345,16 +349,17 @@ proc dispatchAsync(req: Request): Response {.passive.} =
   ## The passive request pipeline: pre-dispatch middleware, then the registered
   ## passive handlers in order, then synchronous route dispatch if none claimed
   ## the request, then post-dispatch middleware. Mirrors `router.dispatchFull`.
-  let sc = runBefore(appRouter, req)
+  let sc = runBefore(routerView()[], req)
   if sc.isSome:
-    return runAfter(appRouter, req, sc.get(default(Response)))
+    return runAfter(routerView()[], req, sc.get(default(Response)))
+  let chain = view(gAsync)
   var i = 0
-  while i < gAsync.len:
-    let a = gAsync[i](req)
+  while i < chain[].len:
+    let a = chain[][i](req)
     if a.isSome:
-      return runAfter(appRouter, req, a.get(default(Response)))
+      return runAfter(routerView()[], req, a.get(default(Response)))
     inc i
-  result = runAfter(appRouter, req, dispatch(appRouter, req))
+  result = runAfter(routerView()[], req, dispatch(routerView()[], req))
 
 proc upgradeToWs(c: Conn; req: Request; ip: string; extraIdx: int) {.passive.} =
   ## The WebSocket upgrade for a request `isWebSocketUpgrade` accepted:
@@ -372,9 +377,9 @@ proc upgradeToWs(c: Conn; req: Request; ip: string; extraIdx: int) {.passive.} =
     accessLog(ip, 403, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
     return
   if extraIdx < 0:
-    let sc = runBefore(appRouter, req)
+    let sc = runBefore(routerView()[], req)
     if sc.isSome:
-      let resp = runAfter(appRouter, req, sc.get(default(Response)))
+      let resp = runAfter(routerView()[], req, sc.get(default(Response)))
       # A claim lingers only when the client sent more than the upgrade
       # request: frames written ahead of the 101 they expected.
       if writeAll(c.fd, serialize(resp, req.httpMethod, closing = true)) and
@@ -393,13 +398,15 @@ proc upgradeToWs(c: Conn; req: Request; ip: string; extraIdx: int) {.passive.} =
   c.acc.setLen(0)
   addInflight(ws.acc.len)
   if extraIdx >= 0:
-    if extraIdx < gExtra.len:
+    let extras = view(gExtra)
+    if extraIdx < extras[].len:
       # Through a local: a passive proc value called straight off a seq
       # element's field miscompiles (see doc/upstream.md).
-      let h = gExtra[extraIdx].handler
+      let h = extras[][extraIdx].handler
       h(ws)
   elif hasWsHandler():
-    gWsHandler(ws)
+    let h = wsHandler()
+    h(ws)
   else:
     echoHandler(ws)
   # Whatever the handler left buffered is released: unparsed frames and a
@@ -441,7 +448,7 @@ proc respond(c: Conn; req: Request; ip: string): bool {.passive.} =
   if hasAsyncHandler():
     resp = dispatchAsync(req)
   else:
-    resp = route(appRouter, c.req)
+    resp = route(routerView()[], c.req)
   var rest = ""
   let st = sendNow(c, resp, req.httpMethod, shouldClose(req), rest)
   result = if st == 0: writeAll(c.fd, rest) else: st > 0
@@ -455,9 +462,9 @@ proc serveSse(c: Conn; req: Request; ip: string; need: int) {.passive.} =
   ## sent more than the request's `need` bytes. Otherwise the handler owns
   ## the fd until it returns.
   let t0 = getMonoTime()
-  let sc = runBefore(appRouter, req)
+  let sc = runBefore(routerView()[], req)
   if sc.isSome:
-    let resp = runAfter(appRouter, req, sc.get(default(Response)))
+    let resp = runAfter(routerView()[], req, sc.get(default(Response)))
     if writeAll(c.fd, serialize(resp, req.httpMethod, closing = true)) and
        sentMore(c, need):
       c.linger = true
@@ -465,7 +472,8 @@ proc serveSse(c: Conn; req: Request; ip: string; need: int) {.passive.} =
   else:
     # Logged as 200 at handoff: a stream has no single end status.
     accessLog(ip, 200, req.httpMethod, req.target, int((getMonoTime() - t0).inMicroseconds))
-    gSseHandler(req, c.fd)
+    let h = sseHandler()
+    h(req, c.fd)
 
 const LingerReadBudget = 65536
   ## Most bytes a lingering connection discards per wake before it polls
@@ -495,8 +503,8 @@ proc lingerWaitMs(t0: MonoTime): int =
   ## The next readiness wait of a linger begun at `t0`: the idle bound,
   ## clipped to what is left of `lingerMs` and to at least 1 ms; 0 once
   ## `lingerMs` has passed.
-  let remaining = gServerConfig.lingerMs - int((getMonoTime() - t0).inMilliseconds)
-  result = if remaining <= 0: 0 else: max(1, min(gServerConfig.lingerIdleMs, remaining))
+  let remaining = serverConfigView()[].lingerMs - int((getMonoTime() - t0).inMilliseconds)
+  result = if remaining <= 0: 0 else: max(1, min(serverConfigView()[].lingerIdleMs, remaining))
 
 proc drainLinger(c: Conn) {.passive.} =
   ## Read and discard what the client still sends, until it closes, errors,
@@ -581,7 +589,7 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
             if keepGoing and not waited: yieldTask()
   subInflight(c.acc.len)   # bytes never parsed leave the count here
   when defined(posix):
-    if c.linger and gServerConfig.lingerMs > 0 and tryEnterLinger():
+    if c.linger and serverConfigView()[].lingerMs > 0 and tryEnterLinger():
       c.acc = ""
       clear(c.req)
       shutdownWrite(fd)
@@ -604,20 +612,20 @@ proc acceptLoop(listenFd: cint; extraIdx: int) {.passive.} =
         # cannot be tracked. Refuse it; this caps concurrent connections.
         log(warn, "refusing fd " & $fd.int & " >= MaxFds " & $MaxFds & " (at connection cap)")
         discard close(fd.cint)
-      elif gServerConfig.maxInflightBytes > 0 and
-           inflightBytes() >= gServerConfig.maxInflightBytes:
+      elif serverConfigView()[].maxInflightBytes > 0 and
+           inflightBytes() >= serverConfigView()[].maxInflightBytes:
         # The aggregate cap: per-connection caps bound one connection, this
         # bounds all of them. Bytes already buffered by live connections
         # outgrow the budget; new ones are refused, not queued.
-        log(warn, "refusing connection: " & $gServerConfig.maxInflightBytes &
+        log(warn, "refusing connection: " & $serverConfigView()[].maxInflightBytes &
             " bytes already buffered across connections")
         discard writeAll(fd.cint, serialize(newResponse(503), closing = true))
         discard close(fd.cint)
       else:
         setNonBlocking(fd.cint)
-        if gServerConfig.tcpNoDelay: setNoDelay(fd.cint)
-        setKeepalive(fd.cint, gServerConfig.keepaliveIdleSec, gServerConfig.keepaliveIntvlSec,
-                     gServerConfig.keepaliveCnt, gServerConfig.userTimeoutMs)
+        if serverConfigView()[].tcpNoDelay: setNoDelay(fd.cint)
+        setKeepalive(fd.cint, serverConfigView()[].keepaliveIdleSec, serverConfigView()[].keepaliveIntvlSec,
+                     serverConfigView()[].keepaliveCnt, serverConfigView()[].userTimeoutMs)
         spawnTask handleConn(fd.cint, extraIdx)
 
 proc reaperLoop() {.passive.} =
@@ -625,7 +633,7 @@ proc reaperLoop() {.passive.} =
   ## deadline (`connreg`). Spawned only when `idleTimeoutMs` or
   ## `wsIdleTimeoutMs` is set: the WebSocket idle close arms a deadline as
   ## the backstop for its own CLOSE.
-  var interval = gServerConfig.reapIntervalMs
+  var interval = serverConfigView()[].reapIntervalMs
   if interval <= 0: interval = 1000
   while true:
     sleepMs(interval)
@@ -670,7 +678,7 @@ proc listenOrQuit(port: uint16; bindAddr, what: string): seq[cint] =
     result.add lr.fd
     listening(what, hostPort(bindAddr, port), lr.fd)
 
-proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
+proc serve*(port: uint16; config = serverConfig(); bindAddr = "") =
   ## Serve HTTP/1.1 on `port`: start the loop and block, dispatching each
   ## request through the registered routes (unmatched: 404). Register routes
   ## and handlers before calling it. `config` sets the size caps, timeouts
@@ -684,6 +692,11 @@ proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
   ## any other literal, such as "192.0.2.10", that address alone. See
   ## `tryListenTcp` and `listenLoopbackPair`. Every bound address is logged.
   ##
+  ## Once the config is validated `serve` seals the boot registries (routes,
+  ## middleware, handlers, `setServerConfig`, `setTrustedProxies`,
+  ## `setAllowedOrigins`, `addWsListener`): a registration after that writes a
+  ## FATAL line to stderr and aborts.
+  ##
   ## A config `validateServerConfig` rejects, or a `setTrustedProxies` entry
   ## `trustedProxyFaults` reports, is logged at error level and the process
   ## exits 1 before anything listens.
@@ -696,6 +709,7 @@ proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
     log(LogLevel.error, "hashi http: invalid trusted proxies — " & badProxies)
     quit(1)
   setServerConfig(config)
+  sealBootConfig()
   let nofile = openFileLimit()
   setLingerCap((if nofile > 0: min(MaxFds, nofile) else: MaxFds) div 4)
   ignoreSigpipe()
@@ -704,14 +718,15 @@ proc serve*(port: uint16; config = gServerConfig; bindAddr = "") =
   for i in 0 ..< mainFds.len:
     let fd = mainFds[i]
     spawnTask acceptLoop(fd, -1)
-  for e in 0 ..< gExtra.len:
-    let extraFds = listenOrQuit(gExtra[e].port, gExtra[e].bindAddr, " (ws-only)")
+  let extras = view(gExtra)
+  for e in 0 ..< extras[].len:
+    let extraFds = listenOrQuit(extras[][e].port, extras[][e].bindAddr, " (ws-only)")
     for i in 0 ..< extraFds.len:
       let fd = extraFds[i]
       spawnTask acceptLoop(fd, e)
   if hasBootTask(): spawnTask bootRunner()
-  if gServerConfig.idleTimeoutMs > 0 or gServerConfig.wsIdleTimeoutMs > 0:
-    log(info, "hashi http: idle reaper on (idle=" & $gServerConfig.idleTimeoutMs &
-              "ms, ws idle=" & $gServerConfig.wsIdleTimeoutMs & "ms)")
+  if serverConfigView()[].idleTimeoutMs > 0 or serverConfigView()[].wsIdleTimeoutMs > 0:
+    log(info, "hashi http: idle reaper on (idle=" & $serverConfigView()[].idleTimeoutMs &
+              "ms, ws idle=" & $serverConfigView()[].wsIdleTimeoutMs & "ms)")
     spawnTask reaperLoop()
   runLoop()
