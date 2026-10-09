@@ -41,11 +41,14 @@ notes.
     `setServerConfig` installed.
   - `initLoop` relies on `initPool` and `initIoRing` being idempotent.
 
-- CI is pinned to Nimony `1f232868`, was `564d789e`: the older pin predates
-  nim-lang/nimony#2588, which sizes `std/threadpool` from the CPU affinity
-  and no longer pins workers, so a server confined to a CPU subset (a
-  container cpuset) spawned one worker per host CPU and stalled. Build hashi
-  with Nimony `1f232868` or later.
+- CI is pinned to Nimony `b3806c1c`, was `564d789e`. The new pin has
+  nim-lang/nimony#2609 (restricted globals, which this release needs);
+  #2588, which sizes `std/threadpool` from the CPU affinity, so a server
+  confined to a CPU subset (a container cpuset) no longer spawns one worker
+  per host CPU and stalls; and #2626, which guards the pool's run-queue
+  stripes with a blocking lock, so a preempted lock holder no longer stalls
+  the other workers' timers (the latency tail under load). Build hashi with
+  Nimony `b3806c1c` or later.
 
 ### Removed
 
