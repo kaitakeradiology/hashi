@@ -108,6 +108,9 @@ socket FFI in `src/hashi/net.nim`.
   outbound queue.
 - [`doc/error-handling.md`](doc/error-handling.md): what a handler can
   raise and what the server catches.
+- [`doc/restricted-globals.md`](doc/restricted-globals.md): porting an
+  application's globals to Nimony's restricted globals, and what hashi 0.1.7
+  changed.
 - [`doc/upstream.md`](doc/upstream.md): Nimony issues found on the way,
   each worked around in the tree.
 
