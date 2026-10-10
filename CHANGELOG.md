@@ -8,6 +8,13 @@ notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- The acceptor sets `O_NONBLOCK` on an accepted fd before the `MaxFds` and
+  in-flight-cap refusals, not after. The cap's 503 was written through the
+  ring on a still-blocking fd, which readiness backends (epoll, kqueue)
+  do not support.
+
 ## [0.1.7] - 2026-10-09
 
 ### Added

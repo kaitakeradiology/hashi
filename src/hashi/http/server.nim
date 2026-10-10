@@ -608,6 +608,9 @@ proc acceptLoop(listenFd: cint; extraIdx: int) {.passive.} =
   while true:
     let fd = waitAccept(listenFd)
     if fd >= 0:
+      # Before any refusal: a readiness backend's ring transfers need an
+      # O_NONBLOCK fd, and the 503 below writes through the ring.
+      setNonBlocking(fd.cint)
       if fd >= MaxFds:
         # connreg's deadline table is indexed by fd, so an fd at or past MaxFds
         # cannot be tracked. Refuse it; this caps concurrent connections.
@@ -623,7 +626,6 @@ proc acceptLoop(listenFd: cint; extraIdx: int) {.passive.} =
         discard writeAll(fd.cint, serialize(newResponse(503), closing = true))
         discard close(fd.cint)
       else:
-        setNonBlocking(fd.cint)
         if serverConfigView()[].tcpNoDelay: setNoDelay(fd.cint)
         setKeepalive(fd.cint, serverConfigView()[].keepaliveIdleSec, serverConfigView()[].keepaliveIntvlSec,
                      serverConfigView()[].keepaliveCnt, serverConfigView()[].userTimeoutMs)
