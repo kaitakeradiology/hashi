@@ -2,7 +2,7 @@
 
 ## WebSocket: Autobahn (RFC 6455)
 
-The official suite, `tests/conformance/autobahn/` (setup in its README), against `examples/ws_echo`. Result on 9 Oct 2026, at
+The official suite, `tests/conformance/autobahn/` (setup in its README), against `examples/ws_echo`. Result on 11 Oct 2026, at
 the CI-pinned Nimony:
 
 | Outcome | Cases | Sections |

@@ -8,6 +8,8 @@ notes.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-10-11
+
 ### Fixed
 
 - The acceptor sets `O_NONBLOCK` on an accepted fd before the `MaxFds` and
@@ -286,7 +288,8 @@ compiler, with no dependencies beyond the Nimony standard library.
 - Conformance: the Autobahn WebSocket suite passes with no failures; a
   raw-socket WebSocket harness and seven parser fuzzers gate CI.
 
-[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/kaitakeradiology/hashi/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/kaitakeradiology/hashi/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/kaitakeradiology/hashi/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/kaitakeradiology/hashi/compare/v0.1.4...v0.1.5
