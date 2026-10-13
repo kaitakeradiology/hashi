@@ -329,6 +329,13 @@ proc shutdownWrite*(fd: cint) =
   ## still deliver what the peer sends.
   discard shutdownSocket(fd, SHUT_WR)
 
+proc shutdownListener*(fd: cint) =
+  ## `shutdown(2)` both directions on a listening socket. A pending accept
+  ## then fails at once and the socket leaves LISTEN, which `close` alone does
+  ## not guarantee while another reference (an in-flight io_uring accept) holds
+  ## the file.
+  discard shutdownSocket(fd, 2.cint)
+
 proc sockRecv*(fd: cint; buf: pointer; len: int; flags: cint): int {.inline.} =
   ## `recv(2)`: the bytes received, or -1 with `errno` set. With `MsgDontWait`
   ## the call does not block whatever the fd's own mode.

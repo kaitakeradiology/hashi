@@ -681,7 +681,19 @@ proc listenOrQuit(port: uint16; bindAddr, what: string): seq[cint] =
     result.add lr.fd
     listening(what, hostPort(bindAddr, port), lr.fd)
 
-proc serve*(port: uint16; config = serverConfig(); bindAddr = "") =
+proc stopServe*() =
+  ## Make `serve` return. Hashi has no server-only stop: this is
+  ## `std/threadpool.shutdownPool`, which sets the one process-wide stop flag
+  ## `runLoop` loops on and joins every pool worker, so it ends EVERY task in
+  ## the process, not only the server's. Finish your own tasks first. Call it
+  ## from a thread that is not a pool worker, and not from a handler (it joins
+  ## the workers). Once `serve` has returned, its listening sockets are shut
+  ## down and closed: a `connect()` to the port is refused. The pool cannot be
+  ## restarted, so this is a once-per-process stop.
+  shutdownPool()
+
+proc serve*(port: uint16; config = serverConfig(); bindAddr = "";
+            onBound: nil proc (port: uint16) {.gcsafe.} = nil) =
   ## Serve HTTP/1.1 on `port`: start the loop and block, dispatching each
   ## request through the registered routes (unmatched: 404). Register routes
   ## and handlers before calling it. `config` sets the size caps, timeouts
@@ -703,6 +715,16 @@ proc serve*(port: uint16; config = serverConfig(); bindAddr = "") =
   ## A config `validateServerConfig` rejects, or a `setTrustedProxies` entry
   ## `trustedProxyFaults` reports, is logged at error level and the process
   ## exits 1 before anything listens.
+  ##
+  ## `onBound`, when given, is called once with the port the main listener
+  ## actually bound (the kernel's choice for `port` 0), on the calling thread,
+  ## after the listeners are open and before any accept task is spawned: no
+  ## request is parsed before it returns. It runs after `sealBootConfig()`, so
+  ## it may only write atomics; a `publish` (or any boot registration) there
+  ## is the documented FATAL abort. Do not block in it.
+  ##
+  ## `stopServe` ends `serve`: it shuts down and closes every listening
+  ## socket, then returns.
   let bad = validateServerConfig(config)
   if bad.len > 0:
     log(LogLevel.error, "hashi http: invalid server config — " & bad)
@@ -718,6 +740,9 @@ proc serve*(port: uint16; config = serverConfig(); bindAddr = "") =
   ignoreSigpipe()
   initLoop()
   let mainFds = listenOrQuit(port, bindAddr, "")
+  var allFds: seq[cint] = @[]
+  for i in 0 ..< mainFds.len: allFds.add mainFds[i]
+  if onBound != nil: onBound(boundPort(mainFds[0]))
   for i in 0 ..< mainFds.len:
     let fd = mainFds[i]
     spawnTask acceptLoop(fd, -1)
@@ -726,6 +751,7 @@ proc serve*(port: uint16; config = serverConfig(); bindAddr = "") =
     let extraFds = listenOrQuit(extras[][e].port, extras[][e].bindAddr, " (ws-only)")
     for i in 0 ..< extraFds.len:
       let fd = extraFds[i]
+      allFds.add fd
       spawnTask acceptLoop(fd, e)
   if hasBootTask(): spawnTask bootRunner()
   if serverConfigView()[].idleTimeoutMs > 0 or serverConfigView()[].wsIdleTimeoutMs > 0:
@@ -733,3 +759,9 @@ proc serve*(port: uint16; config = serverConfig(); bindAddr = "") =
               "ms, ws idle=" & $serverConfigView()[].wsIdleTimeoutMs & "ms)")
     spawnTask reaperLoop()
   runLoop()
+  # Only `stopServe` gets here. Shut the listeners down before closing: an
+  # io_uring accept still pending holds the file, and a bare close would leave
+  # the socket in LISTEN.
+  for i in 0 ..< allFds.len:
+    shutdownListener(allFds[i])
+    discard close(allFds[i])

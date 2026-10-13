@@ -8,6 +8,19 @@ notes.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-10-14
+
+### Added
+
+- `serve` takes an optional `onBound: proc (port: uint16)`. It is called once
+  with the port the main listener actually bound (the kernel's choice for port
+  0), after the listeners open and before any accept task is spawned. It runs
+  after the boot seal, so it may only write atomics.
+- `stopServe()` makes `serve` return. It is `shutdownPool`, so it is
+  process-wide: it ends every task in the process and the pool cannot be
+  restarted. `serve` then shuts down and closes its listening sockets, so a
+  later `connect()` is refused.
+
 ## [0.1.8] - 2026-10-11
 
 ### Fixed
@@ -288,7 +301,8 @@ compiler, with no dependencies beyond the Nimony standard library.
 - Conformance: the Autobahn WebSocket suite passes with no failures; a
   raw-socket WebSocket harness and seven parser fuzzers gate CI.
 
-[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/kaitakeradiology/hashi/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/kaitakeradiology/hashi/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/kaitakeradiology/hashi/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/kaitakeradiology/hashi/compare/v0.1.5...v0.1.6
