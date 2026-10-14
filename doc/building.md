@@ -14,9 +14,11 @@ dependencies beyond Nimony's standard library.
 - For the benchmarks only: `wrk` and a Mummy checkout.
 
 **Platform.** Linux is what CI runs, over epoll or io_uring. `std/ioring`
-also has kqueue, WSAPoll and IOCP backends, so macOS, the BSDs and Windows
-are within reach and untested; the socket FFI in `src/hashi/net.nim` is the
-Linux-specific surface to port first.
+also has kqueue, WSAPoll and IOCP backends. Windows builds with MinGW-w64
+(`--os:windows --cc:x86_64-w64-mingw32-gcc`, ws2_32 linked by `std/ioring`) and
+is tested on a Windows builder, not in CI; its socket calls are
+`src/hashi/winsock.nim`. macOS and the BSDs are within reach and untested; the
+socket FFI in `src/hashi/net.nim` is the surface to port for them.
 
 ## 1. The Nimony toolchain
 

@@ -8,6 +8,25 @@ notes.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-10-14
+
+### Added
+
+- Windows. `src/hashi/winsock.nim` carries the Winsock calls and constants
+  `net.nim` needs, under the names the POSIX arm uses, and `net`, `connreg`,
+  `server`, `session_io` and `outq_pacing` take it on Windows. Linux behaviour
+  is unchanged. Built with MinGW-w64; tested on a Windows builder.
+- Windows listeners take exclusive use of their port (`SO_EXCLUSIVEADDRUSE`):
+  Winsock's `SO_REUSEADDR` would let another process bind a live listener's
+  port. If that `setsockopt` fails the listen fails closed with stage
+  `"sockopt"` (`claimPort` exposes the step). Listening sockets are created
+  non-inheritable (`WSA_FLAG_NO_HANDLE_INHERIT`, plus `SetHandleInformation`,
+  stage `"noinherit"`), and so are accepted sockets.
+- `fdSlot` and `fdTracked` (`hashi/http/connreg`): the deadline table is
+  indexed by slot. A POSIX fd is its own slot; a Winsock handle (a multiple of
+  four, often far above 8192) is `handle shr 2`, so `MaxFds` stays the slot
+  count and `reapExpired` still sweeps 8192 entries.
+
 ## [0.1.9] - 2026-10-14
 
 ### Added
@@ -301,7 +320,8 @@ compiler, with no dependencies beyond the Nimony standard library.
 - Conformance: the Autobahn WebSocket suite passes with no failures; a
   raw-socket WebSocket harness and seven parser fuzzers gate CI.
 
-[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/kaitakeradiology/hashi/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/kaitakeradiology/hashi/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/kaitakeradiology/hashi/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/kaitakeradiology/hashi/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/kaitakeradiology/hashi/compare/v0.1.6...v0.1.7

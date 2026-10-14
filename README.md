@@ -92,11 +92,13 @@ tests/run --fuzz                           # unit tests + fuzzers
 The from-scratch sequence, and a sandboxed proof of it, are in
 [`doc/building.md`](doc/building.md).
 
-**Platforms.** Linux is the only tested platform, over epoll or io_uring. The I/O
-layer is `std/ioring`, which also has kqueue, WSAPoll and IOCP backends,
-and Nimony's Windows target needs no C runtime, so macOS, the BSDs and
-Windows are potentials. The only Linux-specific code is the
-socket FFI in `src/hashi/net.nim`.
+**Platforms.** Linux is the tested platform, over epoll or io_uring. The I/O
+layer is `std/ioring`, which also has kqueue, WSAPoll and IOCP backends.
+Windows has a Winsock arm (`src/hashi/winsock.nim`, used by `net.nim`):
+it listens with `SO_EXCLUSIVEADDRUSE` and non-inheritable sockets, and is
+built and run on a MinGW-w64 builder rather than in CI. macOS and the BSDs
+are potentials; the socket FFI in `src/hashi/net.nim` is the surface to port
+for them.
 
 ## Documentation
 

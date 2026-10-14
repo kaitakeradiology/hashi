@@ -22,7 +22,10 @@
 ## queued mode (`useOutQueue`).
 
 import std/[monotimes, atomics]
-from std/posix/posix import pcall, EAGAIN, EINTR
+when defined(windows):
+  from hashi/winsock import recv, errno, EWOULDBLOCK, EINTR
+else:
+  from std/posix/posix import pcall, EAGAIN, EINTR
 import hashi/loop
 import hashi/buffer
 import hashi/http/request
@@ -34,10 +37,11 @@ import hashi/ws/protocol
 import hashi/ws/session
 import hashi/ws/outq
 
-proc cRecv(fd: cint; buf: pointer; len: csize_t; flags: cint): int {.importc: "recv", header: "<sys/socket.h>".}
-const MsgDontWait = (when defined(macosx): 0x80.cint else: 0x40.cint)
-  ## `MSG_DONTWAIT`: every recv here is non-blocking, whatever the fd's own
-  ## mode. EAGAIN means nothing is buffered yet, not an error.
+when not defined(windows):
+  proc cRecv(fd: cint; buf: pointer; len: csize_t; flags: cint): int {.importc: "recv", header: "<sys/socket.h>".}
+  const MsgDontWait = (when defined(macosx): 0x80.cint else: 0x40.cint)
+    ## `MSG_DONTWAIT`: every recv here is non-blocking, whatever the fd's own
+    ## mode. EAGAIN means nothing is buffered yet, not an error.
 
 const WsCloseGraceMs* = 5000
   ## How long the keepalive's idle close gives its CLOSE frame before the
@@ -264,14 +268,29 @@ proc recvNow(ws: WsConn): int =
   result = ReadLater
   var done = false
   while not done:
-    let n = pcall(cRecv(ws.fd, addr ws.rbuf[0], csize_t(ws.rbuf.len), MsgDontWait))
-    if n >= 0:
-      result = int(n)
-      done = true
-    elif n == -clong(EAGAIN): done = true
-    elif n != -clong(EINTR):
-      result = -1
-      done = true
+    when defined(windows):
+      # Winsock has no MSG_DONTWAIT; the accepted socket is non-blocking itself
+      # (the acceptor sets it), so a plain recv answers WSAEWOULDBLOCK for
+      # "nothing buffered yet".
+      let n = recv(ws.fd, addr ws.rbuf[0], csize_t(ws.rbuf.len), 0.cint)
+      if n >= 0:
+        result = n
+        done = true
+      else:
+        let e = errno()
+        if e == EWOULDBLOCK: done = true
+        elif e != EINTR:
+          result = -1
+          done = true
+    else:
+      let n = pcall(cRecv(ws.fd, addr ws.rbuf[0], csize_t(ws.rbuf.len), MsgDontWait))
+      if n >= 0:
+        result = int(n)
+        done = true
+      elif n == -clong(EAGAIN): done = true
+      elif n != -clong(EINTR):
+        result = -1
+        done = true
 
 proc msLeft(since: int64; intervalMs: int; now: int64): int =
   ## Milliseconds from `now` until `intervalMs` after `since`, both

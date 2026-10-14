@@ -10,13 +10,17 @@
 ## idles between writes, too large and lane prioritising stops mattering.
 ## `useOutQueue` applies `OutQueue.pacingBytes` through this proc at accept.
 
-from std/posix/posix import SOL_SOCKET, SockLen
+when defined(windows):
+  from hashi/winsock import SOL_SOCKET, SockLen, setsockopt, SO_SNDBUF
+else:
+  from std/posix/posix import SOL_SOCKET, SockLen
 
-proc setsockopt(s, level, optname: cint; optval: pointer; optlen: SockLen): cint {.
-  importc, header: "<sys/socket.h>".}
+  proc setsockopt(s, level, optname: cint; optval: pointer; optlen: SockLen): cint {.
+    importc, header: "<sys/socket.h>".}
 
 const
-  SO_SNDBUFloc = 7.cint    ## Linux SOL_SOCKET/SO_SNDBUF.
+  SO_SNDBUFloc = (when defined(windows): SO_SNDBUF else: 7.cint)
+    ## SOL_SOCKET/SO_SNDBUF: 7 on Linux, 0x1001 on Winsock.
 
 proc setWsSendBuf*(fd: cint; bytes: int): bool =
   ## Cap `fd`'s socket send buffer at `bytes` and disable send-buffer

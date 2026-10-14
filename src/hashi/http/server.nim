@@ -20,8 +20,9 @@
 ## handlers needs a lock.
 
 import std/[syncio, opt, strutils, monotimes, times]
-from std/posix/posix import close
-import hashi/net
+when defined(posix):
+  from std/posix/posix import close
+import hashi/net      # on Windows also exports `close` (closesocket)
 import hashi/http/config
 import hashi/private/cfgview
 import hashi/http/connreg
@@ -611,10 +612,22 @@ proc acceptLoop(listenFd: cint; extraIdx: int) {.passive.} =
       # Before any refusal: a readiness backend's ring transfers need an
       # O_NONBLOCK fd, and the 503 below writes through the ring.
       setNonBlocking(fd.cint)
-      if fd >= MaxFds:
-        # connreg's deadline table is indexed by fd, so an fd at or past MaxFds
-        # cannot be tracked. Refuse it; this caps concurrent connections.
-        log(warn, "refusing fd " & $fd.int & " >= MaxFds " & $MaxFds & " (at connection cap)")
+      when defined(windows):
+        # The ring's accepted socket is whatever AcceptEx made it: make it ours
+        # alone, so a child process this one spawns never holds the connection.
+        if not setNoInherit(fd.cint):
+          log(warn, "refusing connection: cannot make the accepted socket non-inheritable")
+          discard close(fd.cint)
+          continue
+      if not fdTracked(fd.cint):
+        # connreg's deadline table is indexed by fdSlot(fd), so an fd whose slot
+        # is at or past MaxFds cannot be tracked. Refuse it; this caps concurrent
+        # connections. (A Winsock handle indexes by fd shr 2, see connreg.)
+        when defined(windows):
+          log(warn, "refusing handle " & $fd.int & " (slot " & $fdSlot(fd.cint) &
+              " >= MaxFds " & $MaxFds & ", at connection cap)")
+        else:
+          log(warn, "refusing fd " & $fd.int & " >= MaxFds " & $MaxFds & " (at connection cap)")
         discard close(fd.cint)
       elif serverConfigView()[].maxInflightBytes > 0 and
            inflightBytes() >= serverConfigView()[].maxInflightBytes:

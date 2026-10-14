@@ -46,14 +46,42 @@
 import std/atomics
 
 const MaxFds* = 8192
-  ## Bound on the fd numbers this registry can track: `gDeadline` below is a
-  ## flat fd-indexed array, so an fd at or past this cannot be armed and the
-  ## acceptor refuses it (see `hashi/http/server`). Raising it costs 8 bytes
-  ## of BSS per fd; it should stay at or above the process's `RLIMIT_NOFILE`,
-  ## since that is what actually bounds the fds this registry can be handed.
+  ## Bound on the SLOTS this registry can track: `gDeadline` below is a flat
+  ## slot-indexed array, so an fd whose slot (see `fdSlot`) is at or past this
+  ## cannot be armed and the acceptor refuses it (see `hashi/http/server`).
+  ## Raising it costs 8 bytes of BSS per slot, and `reapExpired` sweeps every
+  ## one; it should stay at or above the process's `RLIMIT_NOFILE`, since that is
+  ## what actually bounds the fds this registry can be handed. On Windows a slot
+  ## covers four handle values (see `fdSlot`), so the same 8192 slots reach
+  ## handle values up to 32764.
 
-proc shutdownRaw(fd: cint; how: cint): cint {.importc: "shutdown", header: "<sys/socket.h>".}
-const SHUT_RDWR = 2.cint
+when defined(windows):
+  from hashi/winsock import shutdownSocket, SHUT_RDWR
+  proc shutdownRaw(fd: cint; how: cint): cint =
+    shutdownSocket(fd, how)
+else:
+  proc shutdownRaw(fd: cint; how: cint): cint {.importc: "shutdown", header: "<sys/socket.h>".}
+  const SHUT_RDWR = 2.cint
+
+proc fdSlot*(fd: cint): int {.inline.} =
+  ## The `gDeadline` slot of `fd`, or -1 for a negative fd. A POSIX fd is its own
+  ## index. A Winsock `SOCKET` is a kernel handle: a multiple of four whose value
+  ## runs far past the count of live sockets, so it is indexed by `fd shr 2`
+  ## (handles 4, 8, 12... take slots 1, 2, 3...) rather than raising `MaxFds`.
+  ## Slot 0 is never a live socket's. A slot at or past `MaxFds` is untracked.
+  if fd < 0.cint: return -1
+  when defined(windows): result = fd.int shr 2
+  else: result = fd.int
+
+proc slotFd(slot: int): cint {.inline.} =
+  ## The fd `fdSlot` mapped to `slot`.
+  when defined(windows): cint(slot shl 2)
+  else: cint(slot)
+
+proc fdTracked*(fd: cint): bool {.inline.} =
+  ## Whether `fd` has a deadline slot: not negative, and under `MaxFds` slots.
+  let sl = fdSlot(fd)
+  sl >= 0 and sl < MaxFds
 
 var gDeadline: array[MaxFds, int64]   ## 0 = not watched; else the deadline in monotonic ticks.
 var gReapCount: int64                 ## Total connections reaped, for `reapedTotal`.
@@ -81,37 +109,37 @@ proc inflightBytes*(): int64 =
 
 proc setDeadline*(fd: cint; deadlineNanos: int64) =
   ## Arm (deadlineNanos > 0) or disarm (0) the reap deadline for `fd`.
-  if fd >= 0.cint and fd.int < MaxFds:
-    atomicStore(gDeadline[fd.int], deadlineNanos)
+  if fdTracked(fd):
+    atomicStore(gDeadline[fdSlot(fd)], deadlineNanos)
 
 proc deadlineOf*(fd: cint): int64 =
   ## The reap deadline armed for `fd`, or 0 when none is.
   result = 0'i64
-  if fd >= 0.cint and fd.int < MaxFds:
-    result = atomicLoad(gDeadline[fd.int])
+  if fdTracked(fd):
+    result = atomicLoad(gDeadline[fdSlot(fd)])
 
 proc clearConn*(fd: cint) =
   ## Disarm on connection teardown (belt-and-suspenders; the driver also disarms
   ## after each wait returns).
-  if fd >= 0.cint and fd.int < MaxFds:
-    atomicStore(gDeadline[fd.int], 0'i64)
+  if fdTracked(fd):
+    atomicStore(gDeadline[fdSlot(fd)], 0'i64)
 
 proc reapExpired*(nowNanos: int64): int =
   ## Sweep the table; `shutdown()` every fd armed past `nowNanos`. Returns the
   ## number reaped this pass. Called on the reactor from the reaper loop.
   result = 0
-  var fd = 0
-  while fd < MaxFds:
-    let dl = atomicLoad(gDeadline[fd])
+  var sl = 0
+  while sl < MaxFds:
+    let dl = atomicLoad(gDeadline[sl])
     if dl != 0'i64 and nowNanos > dl:
       var expected = dl
       # Claim the reap atomically: only shutdown if the slot still holds the
       # exact expired deadline we saw (guards teardown / fd reuse).
-      if atomicCompareExchange(gDeadline[fd], expected, 0'i64):
-        discard shutdownRaw(fd.cint, SHUT_RDWR)
+      if atomicCompareExchange(gDeadline[sl], expected, 0'i64):
+        discard shutdownRaw(slotFd(sl), SHUT_RDWR)
         discard atomicFetchAdd(gReapCount, 1'i64)
         result = result + 1
-    fd = fd + 1
+    sl = sl + 1
 
 proc reapedTotal*(): int64 =
   ## Cumulative connections reaped since boot (for app /metrics).

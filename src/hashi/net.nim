@@ -9,84 +9,93 @@
 ## non-zero. `listenError` renders that result for an operator.
 ## `listenLoopbackPair` listens on 127.0.0.1 and ::1 on one port, which is
 ## what `serve` does for an empty bind address. The socket calls and
-## constants here are Linux's; this is the module to port first for another
-## platform.
+## constants are Linux's, and Windows's through `hashi/winsock` (same names,
+## Winsock values); another platform starts here.
 
-from std/posix/posix import close, fcntl, F_GETFL, F_SETFL, O_NONBLOCK,
-  AF_INET, AF_INET6, SOCK_STREAM, IPPROTO_TCP, IPPROTO_IPV6, SOL_SOCKET,
-  SO_REUSEADDR, Sockaddr_in, SockLen, EADDRNOTAVAIL, EAFNOSUPPORT, errno
 import std/strutils
 
-# Socket calls and types `std/posix` does not declare yet.
-type
-  CSockAddr {.importc: "struct sockaddr", header: "<sys/socket.h>".} = object
-    ## glibc's `struct sockaddr`; `bind`'s transparent-union argument accepts
-    ## a pointer to this, not to a Nim object of the same layout.
-  Sockaddr_in6 = object
-    ## Linux `sockaddr_in6` layout. Not an importc of `struct in6_addr`,
-    ## whose `s6_addr` member is a glibc macro that breaks codegen; the
-    ## layout is fixed by the ABI, so a cast to `ptr CSockAddr` is sound.
-    sin6_family: uint16
-    sin6_port: uint16            ## network byte order
-    sin6_flowinfo: uint32
-    sin6_addr: array[16, uint8]
-    sin6_scope_id: uint32
-
-const
-  IPV6_V6ONLY = 26.cint          ## `setsockopt` option: v6-only versus dual-stack
-  TCP_NODELAY = 1.cint
-  SO_KEEPALIVE = 9.cint
-  TCP_KEEPIDLE = 4.cint
-  TCP_KEEPINTVL = 5.cint
-  TCP_KEEPCNT = 6.cint
-  TCP_USER_TIMEOUT = 18.cint
-  SHUT_WR = 1.cint
-  MSG_PEEK = 2.cint
-  RLIMIT_NOFILE = 7.cint
-  INET6_ADDRSTRLEN = 46
-
-proc socket(domain, typ, protocol: cint): cint {.importc, header: "<sys/socket.h>".}
-proc setsockopt(s, level, optname: cint; optval: pointer; optlen: SockLen): cint {.
-  importc, header: "<sys/socket.h>".}
-proc bindSocket(s: cint; name: ptr CSockAddr; namelen: SockLen): cint {.
-  importc: "bind", header: "<sys/socket.h>".}
-proc listenSocket(s, backlog: cint): cint {.importc: "listen", header: "<sys/socket.h>".}
-proc htons(x: uint16): uint16 {.importc, header: "<arpa/inet.h>".}
-proc ntohs(x: uint16): uint16 {.importc, header: "<arpa/inet.h>".}
-proc inet_pton(af: cint; src: cstring; dst: pointer): cint {.
-  importc, header: "<arpa/inet.h>".}
-proc inet_ntop(af: cint; src: pointer; dst: cstring; size: SockLen): cstring {.
-  importc, header: "<arpa/inet.h>".}
-proc getpeername(fd: cint; sa: ptr CSockAddr; len: ptr SockLen): cint {.
-  importc, header: "<sys/socket.h>".}
-proc getsockname(fd: cint; sa: ptr CSockAddr; len: ptr SockLen): cint {.
-  importc, header: "<sys/socket.h>".}
-proc signal(signum: cint; handler: pointer): pointer {.
-  importc, header: "<signal.h>".}
-proc shutdownSocket(fd, how: cint): cint {.importc: "shutdown", header: "<sys/socket.h>".}
-proc recv(fd: cint; buf: pointer; len: csize_t; flags: cint): int {.
-  importc, header: "<sys/socket.h>".}
-
-when defined(linux):
-  const MsgDontWait* = 0x40.cint    ## `MSG_DONTWAIT`: this one call does not block.
-  const MsgNoSignal* = 0x4000.cint  ## `MSG_NOSIGNAL`: no SIGPIPE for this one send.
-elif defined(macosx):
-  const MsgDontWait* = 0x80.cint
-  const MsgNoSignal* = 0.cint       ## None here: a send to a reset peer can raise SIGPIPE.
+when defined(windows):
+  import hashi/winsock
+  export winsock.close, winsock.setNoInherit
+  const
+    MsgDontWait* = 0.cint    ## None on Windows: the accepted socket is non-blocking itself.
+    MsgNoSignal* = 0.cint    ## None on Windows: no SIGPIPE; a dead peer fails the send.
+    EADDRINUSE* = 10048.cint ## WSAEADDRINUSE: address already in use.
 else:
-  const MsgDontWait* = 0x80.cint
-  const MsgNoSignal* = 0x20000.cint
+  from std/posix/posix import close, fcntl, F_GETFL, F_SETFL, O_NONBLOCK,
+    AF_INET, AF_INET6, SOCK_STREAM, IPPROTO_TCP, IPPROTO_IPV6, SOL_SOCKET,
+    SO_REUSEADDR, Sockaddr_in, SockLen, EADDRNOTAVAIL, EAFNOSUPPORT, errno
 
-type
-  RLimit {.importc: "struct rlimit", header: "<sys/resource.h>".} = object
-    ## The C struct itself, so the field widths follow the C headers.
-    rlim_cur: uint64
-    rlim_max: uint64
+  # Socket calls and types `std/posix` does not declare yet.
+  type
+    CSockAddr {.importc: "struct sockaddr", header: "<sys/socket.h>".} = object
+      ## glibc's `struct sockaddr`; `bind`'s transparent-union argument accepts
+      ## a pointer to this, not to a Nim object of the same layout.
+    Sockaddr_in6 = object
+      ## Linux `sockaddr_in6` layout. Not an importc of `struct in6_addr`,
+      ## whose `s6_addr` member is a glibc macro that breaks codegen; the
+      ## layout is fixed by the ABI, so a cast to `ptr CSockAddr` is sound.
+      sin6_family: uint16
+      sin6_port: uint16            ## network byte order
+      sin6_flowinfo: uint32
+      sin6_addr: array[16, uint8]
+      sin6_scope_id: uint32
 
-proc getrlimit(resource: cint; rlim: ptr RLimit): cint {.
-  importc, header: "<sys/resource.h>".}
+  const
+    IPV6_V6ONLY = 26.cint          ## `setsockopt` option: v6-only versus dual-stack
+    TCP_NODELAY = 1.cint
+    SO_KEEPALIVE = 9.cint
+    TCP_KEEPIDLE = 4.cint
+    TCP_KEEPINTVL = 5.cint
+    TCP_KEEPCNT = 6.cint
+    TCP_USER_TIMEOUT = 18.cint
+    SHUT_WR = 1.cint
+    MSG_PEEK = 2.cint
+    RLIMIT_NOFILE = 7.cint
+    INET6_ADDRSTRLEN = 46
 
-const EADDRINUSE* = 98.cint   ## Linux `errno`: address already in use.
+  proc socket(domain, typ, protocol: cint): cint {.importc, header: "<sys/socket.h>".}
+  proc setsockopt(s, level, optname: cint; optval: pointer; optlen: SockLen): cint {.
+    importc, header: "<sys/socket.h>".}
+  proc bindSocket(s: cint; name: ptr CSockAddr; namelen: SockLen): cint {.
+    importc: "bind", header: "<sys/socket.h>".}
+  proc listenSocket(s, backlog: cint): cint {.importc: "listen", header: "<sys/socket.h>".}
+  proc htons(x: uint16): uint16 {.importc, header: "<arpa/inet.h>".}
+  proc ntohs(x: uint16): uint16 {.importc, header: "<arpa/inet.h>".}
+  proc inet_pton(af: cint; src: cstring; dst: pointer): cint {.
+    importc, header: "<arpa/inet.h>".}
+  proc inet_ntop(af: cint; src: pointer; dst: cstring; size: SockLen): cstring {.
+    importc, header: "<arpa/inet.h>".}
+  proc getpeername(fd: cint; sa: ptr CSockAddr; len: ptr SockLen): cint {.
+    importc, header: "<sys/socket.h>".}
+  proc getsockname(fd: cint; sa: ptr CSockAddr; len: ptr SockLen): cint {.
+    importc, header: "<sys/socket.h>".}
+  proc signal(signum: cint; handler: pointer): pointer {.
+    importc, header: "<signal.h>".}
+  proc shutdownSocket(fd, how: cint): cint {.importc: "shutdown", header: "<sys/socket.h>".}
+  proc recv(fd: cint; buf: pointer; len: csize_t; flags: cint): int {.
+    importc, header: "<sys/socket.h>".}
+
+  when defined(linux):
+    const MsgDontWait* = 0x40.cint    ## `MSG_DONTWAIT`: this one call does not block.
+    const MsgNoSignal* = 0x4000.cint  ## `MSG_NOSIGNAL`: no SIGPIPE for this one send.
+  elif defined(macosx):
+    const MsgDontWait* = 0x80.cint
+    const MsgNoSignal* = 0.cint       ## None here: a send to a reset peer can raise SIGPIPE.
+  else:
+    const MsgDontWait* = 0x80.cint
+    const MsgNoSignal* = 0x20000.cint
+
+  type
+    RLimit {.importc: "struct rlimit", header: "<sys/resource.h>".} = object
+      ## The C struct itself, so the field widths follow the C headers.
+      rlim_cur: uint64
+      rlim_max: uint64
+
+  proc getrlimit(resource: cint; rlim: ptr RLimit): cint {.
+    importc, header: "<sys/resource.h>".}
+
+  const EADDRINUSE* = 98.cint   ## Linux `errno`: address already in use.
 
 type
   ListenResult* = object
@@ -95,8 +104,30 @@ type
     ok*: bool       ## true when bound and listening
     fd*: cint       ## the listening fd when `ok`, -1 otherwise
     err*: cint      ## `errno` of the failing call, 0 when `ok`
-    stage*: string  ## the failing call: "socket", "bind", "listen", "bindaddr"
-                    ## or "getsockname"
+    stage*: string  ## the failing call: "socket", "sockopt", "noinherit", "bind",
+                    ## "listen", "bindaddr" or "getsockname"
+
+proc claimPort*(fd: cint): cint =
+  ## Make `fd` the one socket that may hold its port, before `bind`: 0 on
+  ## success, otherwise the error of the failed `setsockopt`.
+  ##
+  ## Linux: `SO_REUSEADDR`, so a restart does not wait out TIME_WAIT. Its result
+  ## has always been ignored there, and `tryListenTcp` still ignores it.
+  ##
+  ## Windows: `SO_EXCLUSIVEADDRUSE`, because Winsock's `SO_REUSEADDR` lets
+  ## another process bind a live listener's port and take its connections (and
+  ## whatever token they carry). There a failure is fatal to the listen: it
+  ## fails CLOSED with stage "sockopt", never continuing on a port another
+  ## process could share.
+  result = 0
+  var yes: cint = 1
+  when defined(windows):
+    if setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, addr yes,
+                  SockLen(sizeof(yes))) != 0:
+      result = errno()
+  else:
+    if setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, addr yes, SockLen(sizeof(yes))) != 0:
+      result = errno()
 
 proc tryListenTcp*(port: uint16; backlog = 4096; bindAddr = ""): ListenResult =
   ## Create a non-blocking TCP listen socket on `port`. Never asserts.
@@ -146,8 +177,23 @@ proc tryListenTcp*(port: uint16; backlog = 4096; bindAddr = ""): ListenResult =
     result.err = errno()
     result.stage = "socket"
     return
-  var yes: cint = 1
-  discard setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, addr yes, SockLen(sizeof(yes)))
+  when defined(windows):
+    # The socket was created non-inheritable; clearing the flag again is the
+    # belt to WSA_FLAG_NO_HANDLE_INHERIT's braces, and a socket we cannot make
+    # private is not listened on.
+    if not setNoInherit(fd):
+      result.err = errno()
+      result.stage = "noinherit"
+      discard close(fd)
+      return
+    let claim = claimPort(fd)
+    if claim != 0:
+      result.err = claim
+      result.stage = "sockopt"
+      discard close(fd)
+      return
+  else:
+    discard claimPort(fd)
   var bound = -1.cint
   if v6:
     # V6ONLY off only for the dual-stack wildcard.
@@ -168,8 +214,11 @@ proc tryListenTcp*(port: uint16; backlog = 4096; bindAddr = ""): ListenResult =
     discard close(fd)
     return
   # Non-blocking, as the accept loop expects.
-  let flags = fcntl(fd, F_GETFL)
-  discard fcntl(fd, F_SETFL, flags or O_NONBLOCK)
+  when defined(windows):
+    setNonBlockingSocket(fd)
+  else:
+    let flags = fcntl(fd, F_GETFL)
+    discard fcntl(fd, F_SETFL, flags or O_NONBLOCK)
   result.ok = true
   result.fd = fd
   result.err = 0
@@ -220,6 +269,12 @@ proc listenError*(r: ListenResult; port: uint16): string =
     result = "port " & $port.int & " already in use (EADDRINUSE)"
   elif r.stage == "bindaddr":
     result = "malformed bind address (want an IPv4/IPv6 literal, not a hostname)"
+  elif r.stage == "sockopt":
+    result = "cannot take exclusive use of port " & $port.int &
+             " (setsockopt failed, errno " & $r.err.int & "); not listening"
+  elif r.stage == "noinherit":
+    result = "cannot make the listening socket private to this process (errno " &
+             $r.err.int & "); not listening"
   else:
     result = r.stage & "() failed for port " & $port.int &
              " (errno " & $r.err.int & ")"
@@ -244,13 +299,15 @@ proc setKeepalive*(fd: cint; idleSec, intvlSec, cnt, userTimeoutMs: int) =
     setsockoptInt(fd, IPPROTO_TCP, TCP_KEEPIDLE, idleSec)
     if intvlSec > 0: setsockoptInt(fd, IPPROTO_TCP, TCP_KEEPINTVL, intvlSec)
     if cnt > 0: setsockoptInt(fd, IPPROTO_TCP, TCP_KEEPCNT, cnt)
-  if userTimeoutMs > 0:
-    setsockoptInt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, userTimeoutMs)
+  when not defined(windows):    # Winsock has no TCP_USER_TIMEOUT
+    if userTimeoutMs > 0:
+      setsockoptInt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, userTimeoutMs)
 
 proc ignoreSigpipe*() =
   ## Make a write to a peer-closed socket return EPIPE instead of killing
   ## the process.
-  discard signal(13.cint, cast[pointer](1))
+  when not defined(windows):    # no SIGPIPE on Windows: a dead peer fails the send
+    discard signal(13.cint, cast[pointer](1))
 
 proc addressText(a: array[16, uint8]): string =
   ## The canonical text of IPv6 address `a`: a dotted quad when it is
@@ -341,29 +398,37 @@ proc sockRecv*(fd: cint; buf: pointer; len: int; flags: cint): int {.inline.} =
   ## the call does not block whatever the fd's own mode.
   recv(fd, buf, csize_t(len), flags)
 
-proc sockSend*(fd: cint; buf: pointer; len: int; flags: cint): int {.
-  importc: "send", header: "<sys/socket.h>".}
-  ## `send(2)`: the bytes taken, or -1 with `errno` set (`ENOTSOCK` when `fd`
-  ## is not a socket). With `MsgDontWait` the call does not block whatever
-  ## the fd's own mode.
+when defined(windows):
+  proc sockSend*(fd: cint; buf: pointer; len: int; flags: cint): int =
+    ## `send`: the bytes taken, or -1 with `errno()` set (the Winsock error).
+    ## The socket is non-blocking (the acceptor sets it), and `MsgDontWait` is 0.
+    send(fd, buf, len, flags)
+  # No `sockSendv` here: its one caller, `hashi/loop`'s gather write, is POSIX-only
+  # (Windows takes the ring path).
+else:
+  proc sockSend*(fd: cint; buf: pointer; len: int; flags: cint): int {.
+    importc: "send", header: "<sys/socket.h>".}
+    ## `send(2)`: the bytes taken, or -1 with `errno` set (`ENOTSOCK` when `fd`
+    ## is not a socket). With `MsgDontWait` the call does not block whatever
+    ## the fd's own mode.
 
-type
-  MsgHdr {.importc: "struct msghdr", header: "<sys/socket.h>".} = object
-    ## The C struct itself: only the gather fields are named, and the rest
-    ## stay zero.
-    msg_iov: nil pointer
-    msg_iovlen: int
+  type
+    MsgHdr {.importc: "struct msghdr", header: "<sys/socket.h>".} = object
+      ## The C struct itself: only the gather fields are named, and the rest
+      ## stay zero.
+      msg_iov: nil pointer
+      msg_iovlen: int
 
-proc sendmsg(fd: cint; msg: ptr MsgHdr; flags: cint): int {.
-  importc, header: "<sys/socket.h>".}
+  proc sendmsg(fd: cint; msg: ptr MsgHdr; flags: cint): int {.
+    importc, header: "<sys/socket.h>".}
 
-proc sockSendv*(fd: cint; iov: pointer; cnt: int; flags: cint): int =
-  ## `sendmsg(2)` of the `cnt` `struct iovec`s at `iov`, with the result
-  ## contract of `sockSend`.
-  var msg = default(MsgHdr)
-  msg.msg_iov = iov
-  msg.msg_iovlen = cnt
-  sendmsg(fd, addr msg, flags)
+  proc sockSendv*(fd: cint; iov: pointer; cnt: int; flags: cint): int =
+    ## `sendmsg(2)` of the `cnt` `struct iovec`s at `iov`, with the result
+    ## contract of `sockSend`.
+    var msg = default(MsgHdr)
+    msg.msg_iov = iov
+    msg.msg_iovlen = cnt
+    sendmsg(fd, addr msg, flags)
 
 proc hasPendingInput*(fd: cint): bool =
   ## Whether the peer has sent bytes that are waiting to be read, checked
@@ -374,10 +439,14 @@ proc hasPendingInput*(fd: cint): bool =
 proc openFileLimit*(): int =
   ## The soft `RLIMIT_NOFILE`: how many fds this process may hold open, or
   ## -1 when it cannot be read. An unlimited soft limit reads as `high(int)`.
-  var r = default(RLimit)
-  if getrlimit(RLIMIT_NOFILE, addr r) != 0:
+  ## Windows has no such limit to read: always -1.
+  when defined(windows):
     result = -1
-  elif r.rlim_cur > uint64(high(int)):
-    result = high(int)
   else:
-    result = int(r.rlim_cur)
+    var r = default(RLimit)
+    if getrlimit(RLIMIT_NOFILE, addr r) != 0:
+      result = -1
+    elif r.rlim_cur > uint64(high(int)):
+      result = high(int)
+    else:
+      result = int(r.rlim_cur)
