@@ -8,6 +8,15 @@ notes.
 
 ## [Unreleased]
 
+### Added
+
+- `setAccessLogTarget(f)` (`hashi/http/httplog`): every access-log line, at
+  every status, writes `f(target)` in place of the request target. `f`
+  receives the whole target, path and query. A target can carry an
+  identifier the application must keep out of its logs; the application
+  decides what a line may say. Unset, the target is logged verbatim as
+  before. Boot-time: call it before `serve`.
+
 ## [0.1.10] - 2026-10-14
 
 ### Added
