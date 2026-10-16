@@ -108,22 +108,24 @@ proc requests*(): int =
 
 **Shared containers: a lock, and a cast that says which lock.** `acquire` and
 `release` are `.sync`, so the lock itself needs no cast. The data it guards
-does, and the comment on the cast names the lock:
+does. `hashi/guarded` writes that pattern once, so callers write no cast:
 
 ```nim
-import std/locks
+import hashi/guarded
 
-var gLock: Lock
-var gSessions: Table[string, Session]   # only under gLock
-
-initLock(gLock)
+var gSessions: Guarded[Table[string, Session]]   # reachable only via withLock
+gSessions = initGuarded(initTable[string, Session]())
 
 proc remember*(id: string; s: Session) =
-  acquire(gLock)
-  {.cast(assumeSync).}:   # gSessions: under gLock
-    gSessions[id] = s
-  release(gLock)
+  withLock gSessions:       # `it` is a `var Table[...]` alias of the value
+    it[id] = s
 ```
+
+For state that is several globals under one lock, or not a single value, use
+`guarded(lock): body` with a `TicketLock` (`import std/ticketlocks`). The body
+of either must not `return` or raise (the lock would stay held; there is no
+try/finally, so realtime callers grow no unwinding code), and the alias is
+always called `it`. The module header has the full rules.
 
 - Keep the cast as narrow as the lock. A cast outside a lock is a promise
   the compiler cannot check, so write down why it holds.
