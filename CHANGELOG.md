@@ -16,6 +16,9 @@ notes.
   identifier the application must keep out of its logs; the application
   decides what a line may say. Unset, the target is logged verbatim as
   before. Boot-time: call it before `serve`.
+- `hashi/guarded`: `Guarded[T]` with `initGuarded` and `withLock`, and the
+  `guarded(lock)` template, for lock-protected globals under the
+  restricted-globals check without a cast at the call site.
 
 ## [0.1.10] - 2026-10-14
 
