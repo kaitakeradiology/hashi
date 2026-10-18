@@ -214,10 +214,22 @@ proc waitFill(c: Conn): int {.passive.} =
   ## are deliberately untimed: under TCP flow control a slow-but-alive reader
   ## is indistinguishable from a stalled one, and dead-peer detection on the
   ## write side is `TCP_USER_TIMEOUT`'s job (see `setKeepalive`).
+  ##
+  ## Bytes are used only if the handler wins `claimDeadline` against the
+  ## reaper; otherwise they are dropped and the answer is 0, as for a closed
+  ## peer, so a request is never run on a connection being shut. Once claimed the
+  ## slot is 0, so the handler and its response write run untimed.
   let w = serverConfigView()[].idleTimeoutMs
-  if w > 0: setDeadline(c.fd, getMonoTime().ticks + w.int64 * 1_000_000'i64)
+  var armed = 0'i64
+  if w > 0:
+    armed = getMonoTime().ticks + w.int64 * 1_000_000'i64
+    setDeadline(c.fd, armed)
   result = waitRead(c.fd, addr c.rbuf[0], c.rbuf.len)
-  if w > 0: setDeadline(c.fd, 0'i64)
+  if w > 0:
+    if result > 0:
+      if not claimDeadline(c.fd, armed): result = 0
+    else:
+      setDeadline(c.fd, 0'i64)
   if result > 0:
     addInflight(result)
     appendBytes(c.acc, addr c.rbuf[0], result)

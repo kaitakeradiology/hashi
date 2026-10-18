@@ -20,6 +20,16 @@ notes.
   `guarded(lock)` template, for lock-protected globals under the
   restricted-globals check without a cast at the call site.
 
+### Fixed
+
+- The idle reaper no longer shuts a connection whose request the handler has
+  already read. A keep-alive request landing between the deadline expiring
+  and the handler clearing it was processed while the reaper shut the socket,
+  so its response failed and a retrying client sent it twice. The read now
+  claims its deadline by compare-and-swap (`claimDeadline`); if the reaper
+  won, the bytes are dropped and the connection ends as a reaped one does.
+  `reapWonTotal()` counts those.
+
 ## [0.1.10] - 2026-10-14
 
 ### Added

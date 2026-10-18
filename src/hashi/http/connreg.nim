@@ -7,7 +7,10 @@
 ## runs, and any inbound byte resets it. A recurring reaper sweep calls
 ## `reapExpired`, which `shutdown()`s any fd still armed past its deadline;
 ## that routes through the normal completion path, so the parked read returns
-## <=0 and the driver's existing unwind closes the fd. Two exceptions arm a
+## <=0 and the driver's existing unwind closes the fd. A read that returns
+## bytes takes its deadline back with `claimDeadline` before the request is
+## used: if the reaper got there first the bytes are discarded, so a request
+## is never run on a connection the reaper is shutting. Two exceptions arm a
 ## deadline around a write rather than a read, both in the WebSocket
 ## keepalive: the idle close arms one as a backstop for its own CLOSE and
 ## leaves it armed for teardown's `clearConn`, and with `userTimeoutMs` at 0
@@ -85,6 +88,7 @@ proc fdTracked*(fd: cint): bool {.inline.} =
 
 var gDeadline: array[MaxFds, int64]   ## 0 = not watched; else the deadline in monotonic ticks.
 var gReapCount: int64                 ## Total connections reaped, for `reapedTotal`.
+var gReapWonCount: int64              ## Reads discarded because the reaper claimed first.
 var gWsIdleCloseCount: int64          ## WebSocket idle closes, for `wsIdleClosedTotal`.
 var gInflight: int64                  ## Bytes buffered across connections, not yet consumed.
 var gLingering: int64                 ## Connections lingering now, for `lingeringNow`.
@@ -124,6 +128,19 @@ proc clearConn*(fd: cint) =
   if fdTracked(fd):
     atomicStore(gDeadline[fdSlot(fd)], 0'i64)
 
+proc claimDeadline*(fd: cint; armed: int64): bool =
+  ## Take the deadline `armed` off `fd` after a read returned bytes: true when
+  ## the slot still held exactly `armed`, so the reaper can no longer shut this
+  ## fd for the request; false when the reaper claimed it first (it is
+  ## shutting or has shut the fd, and the bytes must be discarded). Both sides
+  ## compare-and-swap the same slot, so exactly one wins.
+  result = true
+  if fdTracked(fd):
+    var expected = armed
+    if not atomicCompareExchange(gDeadline[fdSlot(fd)], expected, 0'i64):
+      discard atomicFetchAdd(gReapWonCount, 1'i64)
+      result = false
+
 proc reapExpired*(nowNanos: int64): int =
   ## Sweep the table; `shutdown()` every fd armed past `nowNanos`. Returns the
   ## number reaped this pass. Called on the reactor from the reaper loop.
@@ -144,6 +161,12 @@ proc reapExpired*(nowNanos: int64): int =
 proc reapedTotal*(): int64 =
   ## Cumulative connections reaped since boot (for app /metrics).
   atomicLoad(gReapCount)
+
+proc reapWonTotal*(): int64 =
+  ## Cumulative reads discarded because the reaper claimed the deadline
+  ## between the bytes arriving and the handler resuming. Each is also in
+  ## `reapedTotal`.
+  atomicLoad(gReapWonCount)
 
 proc countWsIdleClose*() =
   ## Record one WebSocket closed by its keepalive for inbound silence.
