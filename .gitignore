@@ -11,3 +11,6 @@ htmldocs/
 .vscode/
 
 # Test and benchmark output
+
+# pnak deps directory (hashi has no dependencies; a consumer's link files never belong here)
+deps/

@@ -1,0 +1,16 @@
+# The Nimony toolchain hashi is built and tested with: the suite's pin (harness's toolchain-pin, which harness's
+# strict run checks this file against; hashi itself depends on nothing). `tests/run --strict` (Forgejo CI) refuses any
+# other nimony, or a dirty checkout of it.
+#
+# The commit is on the suite's nimony branch (forge/integration: upstream plus fixes not yet upstreamed), so the
+# GitHub workflow, which can only check out a public nimony, cannot use it yet; it keeps its own NIMONY_REF.
+#
+# First word of the first non-comment line that does not start with "generated": the nimony commit.
+3867ea9eeb24750fb31bf7076210abc1e32582ea
+# Generated, ignored files in the nimony checkout that the module-shadowing rule (TOOLCHAIN-SHADOW) accepts, each with
+# its sha256 (cesium-nim's TOOLCHAIN-SHADOW rule reads them; kept here so the two files match): copies hastur makes at commits nimony tracks (lib/std/system/upstream.commit,
+# src/nifler/nimparser/upstream.commit). Any other untracked or ignored module file under lib/ or src/ is refused.
+generated lib/std/system/upstream/cellseqs_v2.nim 5ebd1c26b7c000eb2495362a3b501c057a36953266c4953f52c9a995c0b9b418
+generated lib/std/system/upstream/orc.nim 397d6be69193d078de5a0bf4c625ccfdc90443c6e02650ffc3904372efb935e4
+generated lib/std/system/upstream/yrc.nim b9a230b4e36b375b4465305c1520badf33ee6240a4851dade4685343d5eab7d8
+generated src/nifler/nimparser/parser.nim aa8284f2cf16d806102f17c727038e5b194e98b03650eca12b5607b15f78bf53
