@@ -2,11 +2,11 @@
 # strict run checks this file against; hashi itself depends on nothing). `tests/run --strict` (Forgejo CI) refuses any
 # other nimony, or a dirty checkout of it.
 #
-# The commit is on the suite's nimony branch (forge/integration: upstream plus fixes not yet upstreamed), so the
-# GitHub workflow, which can only check out a public nimony, cannot use it yet; it keeps its own NIMONY_REF.
+# The commit is on the suite's nimony branch (forge/integration: upstream plus fixes not yet upstreamed). The GitHub
+# workflow pins an upstream commit instead (its NIMONY_REF), on purpose: hashi must keep building with a stock nimony.
 #
 # First word of the first non-comment line that does not start with "generated": the nimony commit.
-3867ea9eeb24750fb31bf7076210abc1e32582ea
+44ee4c4a37d3af4f8f49573d07c6ded19a5c605d
 # Generated, ignored files in the nimony checkout that the module-shadowing rule (TOOLCHAIN-SHADOW) accepts, each with
 # its sha256 (cesium-nim's TOOLCHAIN-SHADOW rule reads them; kept here so the two files match): copies hastur makes at commits nimony tracks (lib/std/system/upstream.commit,
 # src/nifler/nimparser/upstream.commit). Any other untracked or ignored module file under lib/ or src/ is refused.
