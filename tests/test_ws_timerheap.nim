@@ -1,12 +1,12 @@
-## The keepalive's timed polls keep the ring's timer heap bounded.
+## The ring's timer heap holds only the deadlines of ops still in flight.
 ##
-## `std/ioring` never deletes a timer entry when its op completes; a stale
-## entry leaves the heap only when it reaches the top. A long-lived live
-## entry at the top therefore holds back every stale entry behind it, so the
-## heap holds every deadline armed since that entry was armed. The keepalive
-## caps each wait at `MaxKeepalivePollMs` (here lowered through
-## `wsKeepalivePollMs` to keep the run short), which caps how long any entry
-## can sit at the top and so bounds the heap by the poll rate times the cap.
+## `std/ioring` drops a deadline's heap entry when its op completes
+## (`disarmDeadline`), so however many timed polls the keepalive makes, the
+## heap never holds more than one entry per op that is still waiting. Before
+## that, a completed op's entry stayed until it reached the top, and a
+## long-lived entry there held back every stale one behind it; the keepalive's
+## `MaxKeepalivePollMs` cap was what bounded the heap. This test pins the
+## stronger rule.
 ##
 ## The measurement needs one lane read by its own thread, so the pool's
 ## workers are stopped first and the main thread runs every task and polls
@@ -22,7 +22,7 @@ import hashi/ws/frame
 import hashi/ws/protocol
 import hashi/ws/session
 import hashi/ws/session_io
-from std/ioring/core/backend import gTimers, gSlots, gCancelInFlight, ioLane, len
+from std/ioring/core/backend import gTimers, gCancelInFlight, ioLane, len
 import std/ioring/core/slots
 import testkit
 
@@ -35,6 +35,9 @@ const SockStream = 1.cint
 const
   Rate = 100       ## timed polls per second on the busy connection
   CapMs = 1000     ## the keepalive wait cap for this run
+  HeapBound = 4
+    ## Each connection's timed poll, plus a timer apiece (a pending ping or
+    ## close deadline): two connections never need more.
 
 proc nowMs(): int64 = getMonoTime().ticks div 1_000_000
 
@@ -68,19 +71,13 @@ proc serveOne(fd: cint) {.passive.} =
 
 proc heapLen(lane: int): int = gTimers[lane].len
 
-proc liveEntries(lane: int; timersOnly: bool): int =
-  ## Heap entries whose op is still in flight: the slot is in use and holds
-  ## the generation the entry was armed for. `timersOnly` counts just the
-  ## pure timers (`sleepMs` and the like) among them.
+proc timerEntries(lane: int): int =
+  ## Heap entries for pure timers (`sleepMs` and the like).
   result = 0
   var i = 0
   while i < gTimers[lane].a.len:
-    let e = gTimers[lane].a[i]
-    let si = e.slot.int
-    if si >= 0 and si < gSlots[lane].slots.len:
-      if gSlots[lane].slots[si].inUse and gSlots[lane].slots[si].gen == e.gen:
-        if not timersOnly or gSlots[lane].slots[si].op.kind == opTimeout:
-          result = result + 1
+    if gTimers[lane].a[i].slot.op.kind == opTimeout:
+      result = result + 1
     i = i + 1
 
 proc otherLanes(lane: int): int =
@@ -132,21 +129,17 @@ proc runLoad(name: string; ping, idle: int) =
   while nowMs() - t1 < CapMs + 200:
     workTurn()
   let after = heapLen(lane)
-  let live = liveEntries(lane, false)
-  let timers = liveEntries(lane, true)
+  let timers = timerEntries(lane)
   let conns = 2 - atomicLoad(gDone, moAcquire)
   section name
-  echo "  ", measured, " polls/s; heap max ", maxHeap,
-       " (bound ", Rate * CapMs * 3 div 2000, "); after the load: ", after,
-       " entries, ", live, " live, ", timers, " timers, ", conns, " connections"
+  echo "  ", measured, " polls/s; heap max ", maxHeap, " (bound ", HeapBound,
+       "); after the load: ", after, " entries, ", timers, " timers, ",
+       conns, " connections"
   check otherLanes(lane) == 0, "every timed op ran on the one lane"
   check measured * 2 >= Rate, "the load ran at about the rate (" & $measured & "/s)"
-  check maxHeap * 2 >= measured * CapMs div 1000,
-    "the polls were timed: stale entries built up behind the quiet connection"
-  check maxHeap * 2000 <= 3 * Rate * CapMs, "heap length <= 1.5 x rate x cap"
-  let budget = conns + timers
-  check after <= budget, "after one window: one entry per parked connection"
-  check live <= budget, "and every entry left is live"
+  check maxHeap <= HeapBound,
+    "a completed poll's entry left the heap: it never grew with the load"
+  check after <= conns + timers, "after the load: one entry per parked connection"
   peerWrite(busy[1], clientFrame(opClose, closeFrameBody(1000)))
   peerWrite(quiet[1], clientFrame(opClose, closeFrameBody(1000)))
   let t2 = nowMs()
