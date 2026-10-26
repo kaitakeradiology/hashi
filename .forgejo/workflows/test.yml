@@ -1,9 +1,11 @@
-# Forgejo CI: the hashi suite at every push to main, in host mode on a runner
-# with a prebuilt Nimony at /opt/nimony (label build-ct), which must be a git
-# checkout at toolchain-pin's commit (the suite pin; `tests/run --strict`
-# refuses anything else, so moving the pin moves /opt/nimony). The clone is fresh
-# from this repository at the pushed ref, so a run only ever tests what was
-# pushed. The GitHub workflow in .github/ does the same from a cold bootstrap.
+# Forgejo CI: the hashi suite at every push to main, in host mode on the build
+# CT (label build-ct). hashi builds against UPSTREAM nimony, not the suite's
+# forge/integration toolchain at /opt/nimony: it is public, and it has to keep
+# building with a stock nimony. So this job builds upstream nimony at the GitHub
+# workflow's NIMONY_REF, the one pin, read from .github/workflows/test.yml, and
+# caches the result per ref under /build/nimony-upstream (only a bump pays the
+# ~5 min bootstrap). The clone is fresh from this repository at the pushed ref,
+# so a run only ever tests what was pushed.
 name: test
 on:
   push:
@@ -25,8 +27,26 @@ jobs:
           cd "$SRC"
           git checkout --detach "$SHA"
           echo "hashi $(git rev-parse --short HEAD) — $(git log -1 --format=%s)"
-          export NIMONY=/opt/nimony/bin/nimony
-          ./tests/run --strict --fuzz
+
+          REF=$(sed -n 's/^ *NIMONY_REF: *//p' .github/workflows/test.yml)
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "no NIMONY_REF in .github/workflows/test.yml" >&2; exit 2; }
+          TC=/build/nimony-upstream/$REF
+          mkdir -p /build/nimony-upstream
+          # capacity 2: two runs at a new ref must not build into one tree
+          exec 9>/build/nimony-upstream/.lock
+          flock 9
+          if [ ! -x "$TC/nimony/bin/nimony" ]; then
+            rm -rf "$TC"
+            git clone --quiet https://github.com/nim-lang/nimony "$TC/nimony"
+            git -C "$TC/nimony" checkout --quiet --detach "$REF"
+            # hastur clones the pinned ../nativenif itself (over https)
+            (cd "$TC/nimony" && PATH=/opt/nim/bin:$PATH nim c -r src/hastur/hastur --release build all)
+          fi
+          flock -u 9
+          export NIMONY=$TC/nimony/bin/nimony
+          echo "toolchain: upstream nimony $REF"
+
+          ./tests/run --fuzz
           for f in examples/*.nim bench/bench_server.nim tests/smoke_ws_outq.nim; do
             "$NIMONY" c "$f"
           done
