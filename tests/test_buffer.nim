@@ -65,12 +65,12 @@ block:
 
 # ── findCrlf / findCrlfCrlf: exactly strutils.find, without its skip table ──
 var gSeed = 0x2545F491'u32
-proc nextRand(n: int): int =
+proc nextRand(n: int): Natural =
   ## xorshift32: a fixed, reproducible sequence.
   gSeed = gSeed xor (gSeed shl 13)
   gSeed = gSeed xor (gSeed shr 17)
   gSeed = gSeed xor (gSeed shl 5)
-  int(gSeed mod uint32(n))
+  int(gSeed mod uint32(n) and 0x7FFF_FFFF'u32)  # the mask proves it is a Natural
 
 proc crlfNoise(n: int): string =
   const alphabet = "\r\n\ra\n"
@@ -83,7 +83,7 @@ block:
   var cases = 0
   for round in 0 ..< 4000:
     let s = crlfNoise(nextRand(40))
-    let start = if s.len == 0: 0 else: nextRand(s.len + 1)
+    let start: Natural = if s.len == 0: 0 else: nextRand(s.len + 1)
     let last = if nextRand(3) == 0: -1 else: nextRand(s.len + 1) - 1  # never past s.high, like the parser
     inc cases
     if findCrlf(s, start, last) != find(s, "\r\n", start, last): inc mismatches

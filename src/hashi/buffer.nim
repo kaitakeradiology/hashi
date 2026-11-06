@@ -33,15 +33,18 @@ proc copyOut*(dst: pointer; s: string; start, n: int) =
 proc cMemchr(s: pointer; c: cint; n: csize_t): pointer {.
   importc: "memchr", header: "<string.h>".}
 
-proc findLf(s: string; frm, to: int): int =
+proc findLf(s: string; frm, to: int): int {.ensures: result < s.len.} =
   ## The index of the first `\n` in `s[frm..to]`, or -1. `to` < `s.len`.
   if frm > to: return -1
   let base = readRawData(s, 0)
   let p = cMemchr(cast[pointer](cast[uint](base) + uint(frm)), cint(ord('\n')),
                   csize_t(to - frm + 1))
-  if p == nil: -1 else: int(cast[uint](p) - cast[uint](base))
+  if p == nil: return -1
+  result = int(cast[uint](p) - cast[uint](base))
+  {.assume: result < s.len.}          # memchr searched s[frm..to], to < s.len
 
-proc findCrlf*(s: string; start: int; last = -1): int =
+proc findCrlf*(s: string; start: int; last = -1): int {.
+    ensures: result < s.len.} =
   ## The index of the first `"\r\n"` lying wholly within `s[start..last]`
   ## (`last` < 0: to the end), or -1. The same answer as
   ## `strutils.find(s, "\r\n", start, last)`, found with `memchr`.
@@ -54,7 +57,8 @@ proc findCrlf*(s: string; start: int; last = -1): int =
     if s[j - 1] == '\r': return j - 1
     frm = j + 1
 
-proc findCrlfCrlf*(s: string; start: int; last = -1): int =
+proc findCrlfCrlf*(s: string; start: int; last = -1): int {.
+    ensures: result < s.len.} =
   ## The index of the first `"\r\n\r\n"` lying wholly within
   ## `s[start..last]` (`last` < 0: to the end), or -1. The same answer as
   ## `strutils.find(s, "\r\n\r\n", start, last)`, found with `memchr`.

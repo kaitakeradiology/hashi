@@ -3,7 +3,7 @@
 ## `std/ioring`'s worker pool is the scheduler; there is no hand-rolled
 ## event loop. `initLoop` brings up the pool and the ring, `spawnTask`
 ## starts a passive proc on the pool, and `runLoop` makes the calling thread
-## one more worker until the pool is shut down. Both modules are re-exported,
+## one more worker until `stopLoop`. Both modules are re-exported,
 ## so `submit`, `shutdownPool`, `submitTimeout` and friends come with this
 ## one import.
 ##
@@ -63,12 +63,23 @@ proc workTurn*(): bool {.discardable.} =
     else:
       sleep(1)
 
+var gStopLoop: bool   ## accessed atomically; see `stopLoop`
+
+proc stopLoop*() =
+  ## Make `runLoop` return, from any thread (a pool worker included). The
+  ## pool's own stop flag cannot do this: `shutdownPool` resets it once the
+  ## workers are joined, so a loop polling it can miss the stop and go on
+  ## with no workers.
+  atomicStore(gStopLoop, true)
+
 proc runLoop*() =
-  ## Take worker turns on the calling thread until `shutdownPool` is called,
+  ## Take worker turns on the calling thread until `stopLoop` is called,
   ## so the thread that runs the loop works alongside the pool rather than
-  ## only waiting. `serve` calls this.
-  while not stopped():
+  ## only waiting, then shut the pool down here. `serve` calls this.
+  while not atomicLoad(gStopLoop):
     workTurn()
+  shutdownPool()
+  atomicStore(gStopLoop, false)
 
 template spawnTask*(call: untyped) =
   ## Start the passive proc call `call` on the pool and return at once.

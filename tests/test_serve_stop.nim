@@ -2,10 +2,9 @@
 ##
 ## The server runs on the main thread with port 0. `onBound` receives the
 ## kernel's port before any accept task exists; a client task (the boot task,
-## on a pool worker) is served on it; a plain thread then calls `stopServe`
-## (it joins the pool workers, so it cannot be called from one); `serve`
-## returns and the main thread checks that the process is still alive and a
-## connect to the port, on both loopbacks, is refused (ECONNREFUSED): no
+## on a pool worker) is served on it; a plain thread then calls `stopServe`;
+## `serve` returns and the main thread checks that the process is still alive
+## and a connect to the port, on both loopbacks, is refused (ECONNREFUSED): no
 ## listener lingers in LISTEN.
 ##
 ## `onBound` runs after `sealBootConfig()`, so it may only write atomics. A
@@ -94,7 +93,7 @@ proc clientTask() {.passive.} =
   st(gClientDone, true)
 
 proc stopper(arg: pointer) {.nimcall.} =
-  ## A plain thread: `stopServe` joins the pool workers.
+  ## A plain thread, not a pool worker: `stopServe` from outside the pool.
   var waited = 0
   while not ld(gClientDone) and waited < 20000:
     discard cUsleep(1000)

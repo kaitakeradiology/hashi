@@ -130,7 +130,7 @@ proc runPair(userTimeoutMs: int; peerPings: bool): Outcome =
   discard close(lr.fd)
   setNonBlocking(srv)
   setNonBlocking(peer)
-  setNoDelay(srv)
+  net.setNoDelay(srv)                 # std/ioring has one too
   # What the acceptor applies to every connection.
   setKeepalive(srv, cfg.keepaliveIdleSec, cfg.keepaliveIntvlSec, cfg.keepaliveCnt,
                cfg.userTimeoutMs)

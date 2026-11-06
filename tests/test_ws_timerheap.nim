@@ -8,9 +8,9 @@
 ## `MaxKeepalivePollMs` cap was what bounded the heap. This test pins the
 ## stronger rule.
 ##
-## The measurement needs one lane read by its own thread, so the pool's
-## workers are stopped first and the main thread runs every task and polls
-## the only lane in use. One connection receives a message every 10 ms (one
+## The measurement needs one lane read by its own thread, so the pool has one
+## worker: the load runs as a task on it, yielding between steps, and the
+## main thread only waits, so that worker's lane is the only one in use. One connection receives a message every 10 ms (one
 ## timed poll each); a second stays silent, its poll the long-lived entry.
 import std/[syncio, monotimes, atomics]
 from std/posix/posix import close, write, pcall
@@ -29,6 +29,7 @@ import testkit
 proc cSocketpair(domain, typ, protocol: cint; sv: ptr cint): cint {.
   importc: "socketpair", header: "<sys/socket.h>".}
 proc cAlarm(seconds: cuint): cuint {.importc: "alarm", header: "<unistd.h>".}
+proc cUsleep(usec: cuint): cint {.importc: "usleep", header: "<unistd.h>".}
 const AfUnix = 1.cint
 const SockStream = 1.cint
 
@@ -54,8 +55,9 @@ proc clientFrame(op: Opcode; payload: string): string =
 proc peerWrite(fd: cint; s: string) =
   discard pcall(write(fd, readRawData(s, 0), s.len))
 
-var gDone = 0   # both: accessed atomically
+var gDone = 0   # all three: accessed atomically
 var gMsgs = 0
+var gRuns = 0   # runLoad calls finished
 
 proc serveOne(fd: cint) {.passive.} =
   let ws = newWsConn(fd, "")
@@ -94,7 +96,7 @@ proc newPair(): array[2, cint] =
   setNonBlocking(result[0])
   setNonBlocking(result[1])
 
-proc runLoad(name: string; ping, idle: int) =
+proc runLoad(name: string; ping, idle: int) {.passive.} =
   var cfg = defaultServerConfig()
   cfg.wsPingIntervalMs = ping
   cfg.wsIdleTimeoutMs = idle
@@ -114,7 +116,7 @@ proc runLoad(name: string; ping, idle: int) =
   var maxHeap = 0
   var going = true
   while going:
-    workTurn()
+    yieldTask()
     let now = nowMs()
     if now - lastSend >= 1000 div Rate:
       peerWrite(busy[1], msg)
@@ -127,7 +129,7 @@ proc runLoad(name: string; ping, idle: int) =
   # One more window with no load: every stale entry has expired by then.
   let t1 = nowMs()
   while nowMs() - t1 < CapMs + 200:
-    workTurn()
+    yieldTask()
   let after = heapLen(lane)
   let timers = timerEntries(lane)
   let conns = 2 - atomicLoad(gDone, moAcquire)
@@ -144,7 +146,7 @@ proc runLoad(name: string; ping, idle: int) =
   peerWrite(quiet[1], clientFrame(opClose, closeFrameBody(1000)))
   let t2 = nowMs()
   while atomicLoad(gDone, moAcquire) < 2 and nowMs() - t2 < 3000:
-    workTurn()
+    yieldTask()
   check atomicLoad(gDone, moAcquire) == 2, "both connections closed"
   discard close(busy[1])
   discard close(quiet[1])
@@ -152,13 +154,18 @@ proc runLoad(name: string; ping, idle: int) =
 discard cAlarm(60.cuint)
 ignoreSigpipe()
 initLoop()
-echo "  backend: ", (if gCancelInFlight != nil: "io_uring" else: "epoll")
-# Stop the workers: from here on the main thread runs every task, so every op
-# lands on its lane and the heap can be read without racing its owner.
+# Importing std/ioring started a full pool; swap it for one worker (a stopped
+# pool starts afresh).
 shutdownPool()
+initPool(1)
+echo "  backend: ", (if gCancelInFlight != nil: "io_uring" else: "epoll")
+proc both() {.passive.} =
+  runLoad("the default keepalive", 20_000, 60_000)
+  runLoad("pings off, a long idle timeout", 0, 600_000)
+  atomicInc(gRuns)
 
-runLoad("the default keepalive", 20_000, 60_000)
-runLoad("pings off, a long idle timeout", 0, 600_000)
+spawnTask both()
+while atomicLoad(gRuns, moAcquire) == 0: discard cUsleep(10_000)
 
 setServerConfig(defaultServerConfig())
 finish()

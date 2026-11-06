@@ -124,17 +124,18 @@ proc parseMultipartForm*(body, boundary: string): seq[Part] =
     return
 
   let delim = "--" & boundary
-  var pos = find(body, delim)
-  if pos < 0:
+  let partEnd = "\r\n" & delim             # CRLF + the boundary: where a part ends
+  let first = find(body, delim)
+  if first < 0:
     return
-  pos = pos + delim.len
+  var pos: Natural = first + delim.len
 
   while true:
     # Close-delimiter: "--" immediately follows this boundary occurrence —
     # no more parts, and NOT a spurious trailing empty part.
     if pos + 1 < body.len and body[pos] == '-' and body[pos + 1] == '-':
       break
-    if pos + 1 >= body.len or body[pos] != '\r' or body[pos + 1] != '\n':
+    if pos >= body.len - 1 or body[pos] != '\r' or body[pos + 1] != '\n':
       break                                  # not followed by CRLF — malformed, stop
 
     pos = pos + 2                            # skip the boundary line's CRLF
@@ -148,7 +149,7 @@ proc parseMultipartForm*(body, boundary: string): seq[Part] =
     # The real end-of-part delimiter is CRLF immediately followed by the
     # boundary text — this is what keeps an incidental occurrence of the
     # boundary bytes *inside* a part's data from causing a false split.
-    let nextDelim = find(body, "\r\n" & delim, dataStart)
+    let nextDelim = find(body, partEnd, dataStart)
     if nextDelim < 0:
       break                                  # unterminated final part — stop
     let partData = substr(body, dataStart, nextDelim - 1)
@@ -168,7 +169,7 @@ proc parseMultipartForm*(body, boundary: string): seq[Part] =
       li = li + 1
     result.add part
 
-    pos = nextDelim + 2 + delim.len          # step past CRLF + this boundary's text
+    pos = nextDelim + partEnd.len            # step past CRLF + this boundary's text
 
 proc parseMultipart*(req: Request): seq[Part] =
   ## Convenience: read the boundary from `req`'s Content-Type header and

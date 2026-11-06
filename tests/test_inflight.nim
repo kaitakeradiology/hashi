@@ -287,10 +287,12 @@ proc closesConn(resp: string): bool =
 
 proc countOf(hay, needle: string): int =
   result = 0
-  var at = find(hay, needle)
-  while at >= 0:
+  var start: Natural = 0
+  while true:
+    let at = find(hay, needle, start)
+    if at < 0: break
     result = result + 1
-    at = find(hay, needle, at + needle.len)
+    start = at + needle.len
 
 proc closeCodeOf(f: Frame): int =
   result = 0

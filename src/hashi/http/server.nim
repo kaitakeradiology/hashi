@@ -651,7 +651,7 @@ proc acceptLoop(listenFd: cint; extraIdx: int) {.passive.} =
         discard writeAll(fd.cint, serialize(newResponse(503), closing = true))
         discard close(fd.cint)
       else:
-        if serverConfigView()[].tcpNoDelay: setNoDelay(fd.cint)
+        if serverConfigView()[].tcpNoDelay: net.setNoDelay(fd.cint)  # std/ioring has one too
         setKeepalive(fd.cint, serverConfigView()[].keepaliveIdleSec, serverConfigView()[].keepaliveIntvlSec,
                      serverConfigView()[].keepaliveCnt, serverConfigView()[].userTimeoutMs)
         spawnTask handleConn(fd.cint, extraIdx)
@@ -707,15 +707,13 @@ proc listenOrQuit(port: uint16; bindAddr, what: string): seq[cint] =
     listening(what, hostPort(bindAddr, port), lr.fd)
 
 proc stopServe*() =
-  ## Make `serve` return. Hashi has no server-only stop: this is
-  ## `std/threadpool.shutdownPool`, which sets the one process-wide stop flag
-  ## `runLoop` loops on and joins every pool worker, so it ends EVERY task in
-  ## the process, not only the server's. Finish your own tasks first. Call it
-  ## from a thread that is not a pool worker, and not from a handler (it joins
-  ## the workers). Once `serve` has returned, its listening sockets are shut
-  ## down and closed: a `connect()` to the port is refused. The pool cannot be
-  ## restarted, so this is a once-per-process stop.
-  shutdownPool()
+  ## Make `serve` return. Hashi has no server-only stop: this is `stopLoop`,
+  ## after which `serve`'s thread shuts the pool down, so it ends EVERY task
+  ## in the process, not only the server's. Finish your own tasks first. It
+  ## returns at once and may be called from any thread. Once `serve` has
+  ## returned, its listening sockets are shut down and closed: a `connect()`
+  ## to the port is refused. This is a once-per-process stop.
+  stopLoop()
 
 proc serve*(port: uint16; config = serverConfig(); bindAddr = "";
             onBound: nil proc (port: uint16) {.gcsafe.} = nil) =

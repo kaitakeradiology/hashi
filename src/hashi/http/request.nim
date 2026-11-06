@@ -136,7 +136,7 @@ proc eqIgnoreCase*(a, b: string): bool =
     if a[i] != b[i] and toLowerAscii(a[i]) != toLowerAscii(b[i]): return false
   result = true
 
-proc parseField(data: string; a, b: int; h: var Header): bool =
+proc parseField(data: string; a: Natural; b: int; h: var Header): bool =
   ## Parse the field line `data[a ..< b]`. RFC 9112 §5:
   ## `field-name ":" OWS field-value OWS`, where field-name is a token
   ## (RFC 9110 §5.6.2: 1*tchar) — so no whitespace (smuggling defense) and no
@@ -316,7 +316,7 @@ proc parseRequestHead*(data: string; req: var Request): ParseStatus =
   # Field block: lines between the request line and the CRLFCRLF (§5),
   # parsed into `req.headers` in place so a reused request keeps its storage.
   req.headers.setLen(0)
-  var pos = lineEnd + 2
+  var pos: Natural = lineEnd + 2
   while pos < headEnd:
     let fEnd = findCrlf(data, pos, headEnd + 1)
     let lim = if fEnd < 0: headEnd else: fEnd
@@ -324,7 +324,8 @@ proc parseRequestHead*(data: string; req: var Request): ParseStatus =
     if not parseField(data, pos, lim, h):
       return psError
     req.headers.add h
-    pos = lim + 2
+    if fEnd < 0: break                 # the last field
+    pos = fEnd + 2
 
   # Host (RFC 9112 §3.2): an HTTP/1.1 request must carry exactly one; more
   # than one is invalid — a request-routing ambiguity / smuggling vector.
