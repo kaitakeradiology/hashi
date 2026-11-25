@@ -110,12 +110,13 @@ proc publish*[T](f: var Frozen[T]; v: sink T) {.sync.} =
   unlockBoot()
 
 proc edit*[T](f: var Frozen[T]): ptr T {.sync.} =
-  ## The value in place, for a registration to append to. Aborts once sealed.
-  ## Writes through the result are visible to readers once they happen-before
+  ## The value in place, for a registration to append to. Aborts once sealed,
+  ## under the test hook too: there is no value to hand back. Writes through
+  ## the result are visible to readers once they happen-before
   ## `sealBootConfig` (see the module doc).
   lockBoot()
   if bootConfigSealed():
-    if refuseLate(): return nil
+    if refuseLate(): die("FATAL hashi: boot config changed after serve()")
   result = cast[ptr T](slot(f))
   unlockBoot()
 

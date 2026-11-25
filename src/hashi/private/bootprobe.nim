@@ -1,8 +1,9 @@
 ## INTERNAL: test hook for `hashi/bootcfg`, not part of hashi's API.
 ##
 ## A late `publish` or `edit` aborts the process, which a race test cannot
-## survive. Once `countLateRefusals` is called, `bootcfg` instead counts the
-## refusal and returns without storing. Nothing in `src` calls it.
+## survive. Once `countLateRefusals` is called, a late `publish` instead counts
+## the refusal and returns without storing; a late `edit` counts it and still
+## aborts. Nothing in `src` calls it.
 
 import std/atomics
 

@@ -10,6 +10,8 @@
 import hashi/http/request
 import hashi/log
 import hashi/loop
+import hashi/net
+import std/syncio
 
 const Body = "abcdefghijklmnopqrstuvwxyz"
 
@@ -103,7 +105,11 @@ proc acceptLoop(listenFd: cint) {.passive.} =
 
 proc main() =
   initLoop()
-  let listenFd = listenTcp(8080'u16)
+  let l = tryListenTcp(8080'u16)
+  if not l.ok:
+    log(error, listenError(l, 8080'u16))
+    quit(1)
+  let listenFd = l.fd
   log(info, "hashi bench (10ms async delay) on :8080 (fd=" & $listenFd.int & ")")
   spawnTask acceptLoop(listenFd)
   runLoop()
