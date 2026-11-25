@@ -30,6 +30,12 @@ notes.
   to 20% of throughput with four workers. `runLoop` returns within about
   10 ms of `stopLoop`. `workTurn` is unchanged, for a program that wants a
   thread of its own to take turns.
+- A connection with no request waiting yields once and reads again before
+  it waits on the ring. A client that sends its next request as soon as it
+  has the response is then served from that read, without a ring wait. On
+  Nimony at and after nim-lang/nimony#2791, where a task's continuation
+  steps run inline, the read used to follow the response within
+  microseconds, find nothing and park, on nearly every request.
 
 ### Fixed
 

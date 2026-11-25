@@ -560,6 +560,12 @@ proc handleConn(fd: cint; extraIdx: int) {.passive.} =
   while keepGoing:
     keepGoing = false
     var ho = headNow(c)
+    if ho == hoMore:
+      # Look once more after the tasks already queued have run, before
+      # parking on the ring: a client that answers at once has its next
+      # request here by then, and the read costs less than a ring wait.
+      yieldTask()
+      ho = headNow(c)
     let waited = ho == hoMore
     if waited: ho = awaitHead(c)
     case ho
