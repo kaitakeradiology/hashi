@@ -2,8 +2,8 @@
 ##
 ## `std/ioring`'s worker pool is the scheduler; there is no hand-rolled
 ## event loop. `initLoop` brings up the pool and the ring, `spawnTask`
-## starts a passive proc on the pool, and `runLoop` makes the calling thread
-## one more worker until `stopLoop`. Both modules are re-exported,
+## starts a passive proc on the pool, and `runLoop` keeps the calling thread
+## waiting until `stopLoop`. Both modules are re-exported,
 ## so `submit`, `shutdownPool`, `submitTimeout` and friends come with this
 ## one import.
 ##
@@ -41,7 +41,9 @@ else:
   import std/windows/winlean
 
 proc initLoop*() =
-  ## Bring up the worker pool and the I/O ring. Idempotent.
+  ## Bring up the worker pool and the I/O ring. Idempotent. Importing
+  ## `std/ioring` has already started both, with one worker fewer than the
+  ## CPUs the process may run on.
   initPool()
   initIoRing()
 
@@ -72,12 +74,22 @@ proc stopLoop*() =
   ## with no workers.
   atomicStore(gStopLoop, true)
 
+const StopPollMs = 10
+  ## How often `runLoop` looks at the stop flag.
+
 proc runLoop*() =
-  ## Take worker turns on the calling thread until `stopLoop` is called,
-  ## so the thread that runs the loop works alongside the pool rather than
-  ## only waiting, then shut the pool down here. `serve` calls this.
+  ## Wait on the calling thread until `stopLoop` is called, then shut the
+  ## pool down here. `serve` calls this. The pool's workers run every task:
+  ## this thread is not one of them, and a thread outside the pool that took
+  ## turns would pass each completion it handled to another worker's queue.
+  ## It returns within about `StopPollMs` of the stop, sooner when a signal
+  ## interrupts the wait. To run tasks on a thread of your own, call
+  ## `workTurn` in a loop instead.
   while not atomicLoad(gStopLoop):
-    workTurn()
+    when defined(posix):
+      discard usleepMicroseconds(cuint(StopPollMs * 1000))
+    else:
+      sleep(StopPollMs)
   shutdownPool()
   atomicStore(gStopLoop, false)
 

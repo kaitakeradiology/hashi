@@ -20,6 +20,17 @@ notes.
   `guarded(lock)` template, for lock-protected globals under the
   restricted-globals check without a cast at the call site.
 
+### Changed
+
+- `runLoop`, and so `serve`, waits on its thread and runs no task there; the
+  pool's workers run them all. Since Nimony's pool began spreading the
+  submissions of a thread outside it across every worker's queue
+  (nim-lang/nimony#2833), a `runLoop` that took worker turns moved each
+  connection it touched to another thread on every request, which cost 15
+  to 20% of throughput with four workers. `runLoop` returns within about
+  10 ms of `stopLoop`. `workTurn` is unchanged, for a program that wants a
+  thread of its own to take turns.
+
 ### Fixed
 
 - The idle reaper no longer shuts a connection whose request the handler has
