@@ -57,7 +57,7 @@ safe, state shared between handlers needs a lock.
 
 ## Status
 
-v0.1.0. HTTP/1.1 and WebSocket over TCP are complete. HTTP/3, QUIC and
+HTTP/1.1 and WebSocket over TCP are complete. HTTP/3, QUIC and
 WebTransport over HTTP/3 are next, via ngtcp2 and nghttp3; HTTP/2 is
 skipped by design.
 
