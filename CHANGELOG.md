@@ -36,6 +36,10 @@ notes.
   Nimony at and after nim-lang/nimony#2791, where a task's continuation
   steps run inline, the read used to follow the response within
   microseconds, find nothing and park, on nearly every request.
+- CI is pinned to Nimony `d5b04a3e`, was `fc05fbac`. Nimony now proves an
+  argument bound to a range parameter (nim-lang/nimony#2856), rejects `nil`
+  as the result of a `ptr T` proc (#3061) and has `listenTcp` raise (#3085),
+  and hashi's source follows. Build hashi with Nimony `d5b04a3e` or later.
 
 ### Fixed
 
